@@ -1,0 +1,835 @@
+/*
+ * txtmux —— 多路 TXT 中继管理器（纯 Win32，XP SP1 ~ Windows 11，32/64 位）。
+ *
+ * 每条规则 = 「一个 DNS TXT 记录 + 一个本地监听端口」：
+ *   本机某端口收到连接 → 查 TXT 得到 ip:port → 建连 → 双向转发。
+ * TXT 结果按规则缓存 30 秒；解析失败沿用上次成功地址。
+ */
+
+#define _WIN32_WINNT 0x0501
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windns.h>
+#include <commctrl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+
+#define APP_TITLE     L"TXT 端口转发 (txtmux)"
+#define WM_APP_LOG    (WM_APP + 1)
+#define WM_APP_STATE  (WM_APP + 2)
+#define IDT_REFRESH   1
+
+#define IDC_ED_RECORD 2001
+#define IDC_ED_PORT   2002
+#define IDC_LB_RULES  2003
+#define IDC_ED_LOG    2004
+#define IDC_LB_STATUS 2005
+#define IDC_CK_AUTO   2006
+#define IDC_BT_ADD    1001
+#define IDC_BT_DEL    1002
+#define IDC_BT_START  1003
+#define IDC_BT_STOP   1004
+#define IDC_BT_ENABLE 1005
+#define IDC_BT_DISABLE 1006
+
+#define MAX_RULES      32
+#define RESOLVE_TTL_MS 30000
+#define MAX_LOG_CHARS  16000
+
+typedef struct {
+    WCHAR record[256];
+    int port;
+    BOOL enabled;   /* 是否参与「启动全部」/ 自动启动 */
+    /* 运行时 */
+    SOCKET listenSock;
+    HANDLE thread;
+    volatile LONG stopFlag;
+    volatile LONG running;
+    /* 解析缓存 */
+    WCHAR targetHost[256];
+    int targetPort;
+    DWORD targetTick;
+    BOOL hasTarget;
+} RULE;
+
+static HINSTANCE g_inst;
+static HWND g_hwnd, g_edRecord, g_edPort, g_lbRules, g_edLog, g_lbStatus, g_ckAuto;
+static WCHAR g_iniPath[MAX_PATH];
+static CRITICAL_SECTION g_lock;
+static WCHAR *g_logBuf;
+static size_t g_logLen, g_logCap;
+static RULE *g_rules[MAX_RULES];
+static int g_ruleCount;
+static BOOL g_autoStart;
+
+/* ---------- 日志 ---------- */
+
+static void log_line(const WCHAR *fmt, ...)
+{
+    WCHAR line[1024];
+    va_list ap;
+    SYSTEMTIME st;
+
+    va_start(ap, fmt);
+    _vsnwprintf(line, 1000, fmt, ap);
+    va_end(ap);
+    GetLocalTime(&st);
+
+    EnterCriticalSection(&g_lock);
+    if (!g_logBuf) {
+        g_logCap = MAX_LOG_CHARS + 2048;
+        g_logBuf = (WCHAR *)calloc(g_logCap, sizeof(WCHAR));
+    }
+    if (g_logBuf) {
+        int n = _snwprintf(g_logBuf + g_logLen, g_logCap - g_logLen - 1,
+                           L"%02d:%02d:%02d %s\r\n", st.wHour, st.wMinute, st.wSecond, line);
+        if (n > 0) {
+            g_logLen += (size_t)n;
+            if (g_logLen >= g_logCap - 1) {
+                size_t keep = g_logCap / 2;
+                memmove(g_logBuf, g_logBuf + (g_logLen - keep), keep * sizeof(WCHAR));
+                g_logLen = keep;
+                g_logBuf[g_logLen] = 0;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+
+    if (g_hwnd) PostMessage(g_hwnd, WM_APP_LOG, 0, 0);
+}
+
+/* ---------- 小工具 ---------- */
+
+static void get_text(HWND h, WCHAR *out, int cch)
+{
+    out[0] = 0;
+    if (h) GetWindowTextW(h, out, cch);
+}
+
+/* ---------- DNS ---------- */
+
+static BOOL resolve_txt(const WCHAR *record, WCHAR *out, int outCch)
+{
+    PDNS_RECORD result = NULL;
+    DNS_STATUS st;
+    BOOL found = FALSE;
+
+    st = DnsQuery_W(record, DNS_TYPE_TEXT, DNS_QUERY_STANDARD, NULL, &result, NULL);
+    if (st != 0 || !result) return FALSE;
+
+    {
+        PDNS_RECORD rec;
+        for (rec = result; rec && !found; rec = rec->pNext) {
+            if (rec->wType == DNS_TYPE_TEXT) {
+                DNS_TXT_DATAW *txt = (DNS_TXT_DATAW *)&rec->Data;
+                if (txt->dwStringCount > 0) {
+                    WCHAR value[512];
+                    DWORD i;
+                    value[0] = 0;
+                    for (i = 0; i < txt->dwStringCount && i < 8; i++) {
+                        lstrcpynW(value + lstrlenW(value), txt->pStringArray[i], 200);
+                    }
+                    {
+                        WCHAR *s = value, *e;
+                        while (*s == L' ' || *s == L'\t') s++;
+                        e = s + lstrlenW(s);
+                        while (e > s && (e[-1] == L' ' || e[-1] == L'\t' || e[-1] == L'\r' || e[-1] == L'\n')) e--;
+                        *e = 0;
+                    }
+                    if (value[0]) {
+                        lstrcpynW(out, value, outCch);
+                        found = TRUE;
+                    }
+                }
+            }
+        }
+    }
+    DnsRecordListFree(result, DnsFreeRecordList);
+    return found;
+}
+
+/* 解析 "host:port" / "[v6]:port" */
+static void copy_n(WCHAR *dst, const WCHAR *src, int count, int cch)
+{
+    if (count >= cch) count = cch - 1;
+    if (count < 0) count = 0;
+    memcpy(dst, src, (size_t)count * sizeof(WCHAR));
+    dst[count] = 0;
+}
+
+static BOOL parse_endpoint(const WCHAR *raw, WCHAR *hostOut, int hostCch, int *portOut)
+{
+    const WCHAR *colon;
+
+    while (*raw == L' ' || *raw == L'\t') raw++;
+    if (!raw[0]) return FALSE;
+
+    if (raw[0] == L'[') {
+        const WCHAR *close = wcschr(raw, L']');
+        if (!close) return FALSE;
+        copy_n(hostOut, raw + 1, (int)(close - raw) - 1, hostCch);
+        if (close[1] != L':') return FALSE;
+        *portOut = _wtoi(close + 2);
+    } else {
+        colon = wcschr(raw, L':');
+        if (colon && wcsrchr(raw, L':') == colon) {
+            copy_n(hostOut, raw, (int)(colon - raw), hostCch);
+            *portOut = _wtoi(colon + 1);
+        } else {
+            return FALSE; /* 没端口或裸 IPv6，不支持 */
+        }
+    }
+    return hostOut[0] && *portOut > 0 && *portOut <= 65535;
+}
+
+/* 取该规则当前目标（带缓存与回退） */
+static BOOL rule_target(RULE *r, WCHAR *host, int *port, BOOL *changed)
+{
+    WCHAR raw[512], h[256];
+    int p = 0;
+
+    *changed = FALSE;
+
+    EnterCriticalSection(&g_lock);
+    if (r->hasTarget && (GetTickCount() - r->targetTick) < RESOLVE_TTL_MS) {
+        lstrcpynW(host, r->targetHost, 256);
+        *port = r->targetPort;
+        LeaveCriticalSection(&g_lock);
+        return TRUE;
+    }
+    LeaveCriticalSection(&g_lock);
+
+    if (resolve_txt(r->record, raw, 512) && parse_endpoint(raw, h, 256, &p)) {
+        EnterCriticalSection(&g_lock);
+        if (!r->hasTarget || lstrcmpW(r->targetHost, h) != 0 || r->targetPort != p) *changed = TRUE;
+        lstrcpynW(r->targetHost, h, 256);
+        r->targetPort = p;
+        r->targetTick = GetTickCount();
+        r->hasTarget = TRUE;
+        LeaveCriticalSection(&g_lock);
+        lstrcpynW(host, h, 256);
+        *port = p;
+        if (*changed) log_line(L"%s -> %s:%d", r->record, h, p);
+        return TRUE;
+    }
+
+    EnterCriticalSection(&g_lock);
+    if (r->hasTarget) {
+        lstrcpynW(host, r->targetHost, 256);
+        *port = r->targetPort;
+        LeaveCriticalSection(&g_lock);
+        log_line(L"WARN 解析 %s 失败，沿用 %s:%d", r->record, host, *port);
+        return TRUE;
+    }
+    LeaveCriticalSection(&g_lock);
+    return FALSE;
+}
+
+/* ---------- 转发 ---------- */
+
+typedef struct {
+    SOCKET from;
+    SOCKET to;
+} COPY_CTX;
+
+static DWORD WINAPI copy_thread(LPVOID param)
+{
+    COPY_CTX *ctx = (COPY_CTX *)param;
+    char buf[8192];
+    for (;;) {
+        int n = recv(ctx->from, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        {
+            int sent = 0;
+            while (sent < n) {
+                int w = send(ctx->to, buf + sent, n - sent, 0);
+                if (w <= 0) { sent = n; break; }
+                sent += w;
+            }
+            if (sent != n) break;
+        }
+    }
+    shutdown(ctx->to, SD_SEND);
+    return 0;
+}
+
+typedef struct {
+    RULE *rule;
+    SOCKET client;
+} CLIENT_CTX;
+
+static DWORD WINAPI client_thread(LPVOID param)
+{
+    CLIENT_CTX *ctx = (CLIENT_CTX *)param;
+    RULE *r = ctx->rule;
+    SOCKET client = ctx->client;
+    WCHAR host[256];
+    int port = 0;
+    BOOL changed = FALSE;
+    char hostA[256], portA[16];
+    struct addrinfo hints, *res = NULL, *p;
+    SOCKET upstream = INVALID_SOCKET;
+    COPY_CTX up, down;
+    HANDLE th1, th2;
+
+    free(ctx);
+
+    if (!rule_target(r, host, &port, &changed)) {
+        log_line(L"[%s] 没有可用目标，丢弃连接", r->record);
+        closesocket(client);
+        return 0;
+    }
+
+    WideCharToMultiByte(CP_ACP, 0, host, -1, hostA, sizeof(hostA), NULL, NULL);
+    _snprintf(portA, sizeof(portA), "%d", port);
+
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(hostA, portA, &hints, &res) != 0) {
+        log_line(L"[%s] 解析目标 %s 失败", r->record, host);
+        closesocket(client);
+        return 0;
+    }
+
+    for (p = res; p; p = p->ai_next) {
+        upstream = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (upstream == INVALID_SOCKET) continue;
+        if (connect(upstream, p->ai_addr, (int)p->ai_addrlen) == 0) break;
+        closesocket(upstream);
+        upstream = INVALID_SOCKET;
+    }
+    freeaddrinfo(res);
+
+    if (upstream == INVALID_SOCKET) {
+        log_line(L"[%s] 连接 %s:%d 失败", r->record, host, port);
+        closesocket(client);
+        return 0;
+    }
+
+    up.from = client;   up.to = upstream;
+    down.from = upstream; down.to = client;
+    th1 = CreateThread(NULL, 0, copy_thread, &up, 0, NULL);
+    th2 = CreateThread(NULL, 0, copy_thread, &down, 0, NULL);
+    if (th1) { WaitForSingleObject(th1, INFINITE); CloseHandle(th1); }
+    if (th2) { WaitForSingleObject(th2, INFINITE); CloseHandle(th2); }
+
+    closesocket(client);
+    closesocket(upstream);
+    return 0;
+}
+
+static DWORD WINAPI accept_thread(LPVOID param)
+{
+    RULE *r = (RULE *)param;
+    struct sockaddr_in addr;
+    SOCKET s;
+    BOOL reuse = TRUE;
+
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        log_line(L"[%s] 创建 socket 失败", r->record);
+        InterlockedExchange(&r->running, 0);
+        return 0;
+    }
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+
+    ZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((u_short)r->port);
+
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(s, 16) != 0) {
+        log_line(L"[%s] 监听 127.0.0.1:%d 失败（端口被占用？）", r->record, r->port);
+        closesocket(s);
+        InterlockedExchange(&r->running, 0);
+        PostMessage(g_hwnd, WM_APP_STATE, 0, 0);
+        return 0;
+    }
+
+    r->listenSock = s;
+    InterlockedExchange(&r->running, 1);
+    log_line(L"[%s] 已监听 127.0.0.1:%d", r->record, r->port);
+    PostMessage(g_hwnd, WM_APP_STATE, 0, 0);
+
+    while (!r->stopFlag) {
+        fd_set set;
+        struct timeval tv;
+        SOCKET client;
+
+        FD_ZERO(&set);
+        FD_SET(s, &set);
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000;
+        if (select(0, &set, NULL, NULL, &tv) <= 0) continue;
+
+        client = accept(s, NULL, NULL);
+        if (client == INVALID_SOCKET) continue;
+        {
+            CLIENT_CTX *ctx = (CLIENT_CTX *)calloc(1, sizeof(CLIENT_CTX));
+            HANDLE th;
+            if (!ctx) { closesocket(client); continue; }
+            ctx->rule = r;
+            ctx->client = client;
+            th = CreateThread(NULL, 0, client_thread, ctx, 0, NULL);
+            if (th) CloseHandle(th); else { closesocket(client); free(ctx); }
+        }
+    }
+
+    closesocket(s);
+    r->listenSock = INVALID_SOCKET;
+    InterlockedExchange(&r->running, 0);
+    PostMessage(g_hwnd, WM_APP_STATE, 0, 0);
+    return 0;
+}
+
+/* 解析 ini 里的一行规则："record port [enabled]"。enabled 省略时视为 1。 */
+static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int *port, BOOL *enabled)
+{
+    const WCHAR *p = line;
+    const WCHAR *tok;
+    int i = 0;
+    WCHAR num[32];
+
+    while (*p == L' ' || *p == L'\t') p++;
+    if (!*p) return FALSE;
+
+    tok = p;
+    while (*p && *p != L' ' && *p != L'\t') p++;
+    {
+        int len = (int)(p - tok);
+        if (len <= 0 || len >= recordCch) return FALSE;
+        memcpy(record, tok, (size_t)len * sizeof(WCHAR));
+        record[len] = 0;
+    }
+
+    while (*p == L' ' || *p == L'\t') p++;
+    if (!*p) return FALSE;
+    i = 0;
+    while (*p && *p != L' ' && *p != L'\t' && i < 31) num[i++] = *p++;
+    num[i] = 0;
+    *port = _wtoi(num);
+    if (*port <= 0 || *port > 65535) return FALSE;
+
+    while (*p == L' ' || *p == L'\t') p++;
+    if (*p == L'0') *enabled = FALSE;
+    else *enabled = TRUE;
+    return TRUE;
+}
+
+/* ---------- 规则管理 ---------- */
+
+static void rule_start(RULE *r)
+{
+    if (r->thread) return;
+    r->stopFlag = 0;
+    r->thread = CreateThread(NULL, 0, accept_thread, r, 0, NULL);
+}
+
+static void rule_stop(RULE *r)
+{
+    if (!r->thread) return;
+    r->stopFlag = 1;
+    WaitForSingleObject(r->thread, 3000);
+    CloseHandle(r->thread);
+    r->thread = NULL;
+    r->listenSock = INVALID_SOCKET;
+    InterlockedExchange(&r->running, 0);
+}
+
+static void refresh_list(void)
+{
+    int i, sel;
+    WCHAR line[512];
+
+    if (!g_lbRules) return;
+    sel = (int)SendMessageW(g_lbRules, LB_GETCURSEL, 0, 0);
+    SendMessageW(g_lbRules, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_lbRules, LB_RESETCONTENT, 0, 0);
+    for (i = 0; i < g_ruleCount; i++) {
+        RULE *r = g_rules[i];
+        WCHAR state[300];
+        if (r->thread && r->running) {
+            EnterCriticalSection(&g_lock);
+            if (r->hasTarget)
+                _snwprintf(state, 300, L"运行中 → %s:%d", r->targetHost, r->targetPort);
+            else
+                lstrcpynW(state, L"运行中（等待解析）", 300);
+            LeaveCriticalSection(&g_lock);
+        } else if (r->thread) {
+            lstrcpynW(state, L"启动中…", 300);
+        } else if (!r->enabled) {
+            lstrcpynW(state, L"已禁用", 300);
+        } else {
+            lstrcpynW(state, L"已停止", 300);
+        }
+        _snwprintf(line, 512, L"%-28s  :%-6d  %s", r->record, r->port, state);
+        SendMessageW(g_lbRules, LB_ADDSTRING, 0, (LPARAM)line);
+    }
+    SendMessageW(g_lbRules, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_lbRules, NULL, TRUE);
+    if (sel >= 0 && sel < g_ruleCount) SendMessageW(g_lbRules, LB_SETCURSEL, sel, 0);
+}
+
+static void config_save(void)
+{
+    WCHAR buf[512];
+    int i;
+
+    WritePrivateProfileStringW(L"main", L"autostart", g_autoStart ? L"1" : L"0", g_iniPath);
+    _snwprintf(buf, 512, L"%d", g_ruleCount);
+    WritePrivateProfileStringW(L"main", L"count", buf, g_iniPath);
+
+    for (i = 0; i < MAX_RULES; i++) {
+        WCHAR key[32];
+        _snwprintf(key, 32, L"rule%d", i + 1);
+        if (i < g_ruleCount) {
+            _snwprintf(buf, 512, L"%s %d %d", g_rules[i]->record, g_rules[i]->port,
+                       g_rules[i]->enabled ? 1 : 0);
+            WritePrivateProfileStringW(L"rules", key, buf, g_iniPath);
+        } else {
+            WritePrivateProfileStringW(L"rules", key, NULL, g_iniPath);
+        }
+    }
+}
+
+static void config_load(void)
+{
+    WCHAR buf[512], key[32];
+    int count, i;
+
+    g_autoStart = GetPrivateProfileIntW(L"main", L"autostart", 1, g_iniPath) ? TRUE : FALSE;
+    count = GetPrivateProfileIntW(L"main", L"count", 0, g_iniPath);
+    if (count > MAX_RULES) count = MAX_RULES;
+
+    g_ruleCount = 0;
+    for (i = 0; i < count; i++) {
+        WCHAR rec[256];
+        int port = 0;
+        BOOL enabled = TRUE;
+
+        _snwprintf(key, 32, L"rule%d", i + 1);
+        buf[0] = 0;
+        GetPrivateProfileStringW(L"rules", key, L"", buf, 512, g_iniPath);
+        if (!parse_rule_line(buf, rec, 256, &port, &enabled)) continue;
+        {
+            RULE *r = (RULE *)calloc(1, sizeof(RULE));
+            if (!r) break;
+            lstrcpynW(r->record, rec, 256);
+            r->port = port;
+            r->enabled = enabled;
+            r->listenSock = INVALID_SOCKET;
+            g_rules[g_ruleCount++] = r;
+        }
+    }
+}
+
+/* ---------- 界面 ---------- */
+
+static HWND mk(const WCHAR *cls, const WCHAR *text, DWORD style, int x, int y, int w, int h, int id, HFONT font)
+{
+    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                             x, y, w, h, g_hwnd, (HMENU)(INT_PTR)id, g_inst, NULL);
+    if (c && font) SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+    return c;
+}
+
+static void build_ui(void)
+{
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    mk(L"STATIC", L"TXT 记录", SS_LEFT, 18, 20, 76, 20, 0, font);
+    g_edRecord = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 96, 18, 300, 24, IDC_ED_RECORD, font);
+
+    mk(L"STATIC", L"本地端口", SS_LEFT, 404, 20, 56, 20, 0, font);
+    g_edPort = mk(L"EDIT", L"9000", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 462, 18, 56, 24, IDC_ED_PORT, font);
+
+    mk(L"BUTTON", L"添加", BS_PUSHBUTTON, 526, 18, 76, 26, IDC_BT_ADD, font);
+
+    g_lbRules = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 18, 54, 588, 168, IDC_LB_RULES, font);
+
+    mk(L"BUTTON", L"启用所选", BS_PUSHBUTTON, 18, 232, 78, 30, IDC_BT_ENABLE, font);
+    mk(L"BUTTON", L"停用所选", BS_PUSHBUTTON, 100, 232, 78, 30, IDC_BT_DISABLE, font);
+    mk(L"BUTTON", L"删除", BS_PUSHBUTTON, 182, 232, 64, 30, IDC_BT_DEL, font);
+    mk(L"BUTTON", L"全部启动", BS_PUSHBUTTON, 250, 232, 78, 30, IDC_BT_START, font);
+    mk(L"BUTTON", L"全部停止", BS_PUSHBUTTON, 332, 232, 78, 30, IDC_BT_STOP, font);
+    g_ckAuto = mk(L"BUTTON", L"启动时自动连接", BS_AUTOCHECKBOX, 420, 236, 120, 24, IDC_CK_AUTO, font);
+    g_lbStatus = mk(L"STATIC", L"", SS_LEFT, 548, 240, 58, 22, IDC_LB_STATUS, font);
+
+    g_edLog = mk(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                 18, 272, 588, 150, IDC_ED_LOG, font);
+}
+
+static void on_add(void)
+{
+    WCHAR record[256], portText[32];
+    int port, i;
+
+    get_text(g_edRecord, record, 256);
+    get_text(g_edPort, portText, 32);
+    port = _wtoi(portText);
+
+    if (!record[0]) { log_line(L"记录名不能为空"); return; }
+    if (port <= 0 || port > 65535) { log_line(L"本地端口不合法"); return; }
+    if (g_ruleCount >= MAX_RULES) { log_line(L"最多 %d 条规则", MAX_RULES); return; }
+
+    for (i = 0; i < g_ruleCount; i++) {
+        if (g_rules[i]->port == port) { log_line(L"端口 %d 已被规则 #%d 使用", port, i + 1); return; }
+        if (lstrcmpiW(g_rules[i]->record, record) == 0) { log_line(L"记录 %s 已存在", record); return; }
+    }
+
+    {
+        RULE *r = (RULE *)calloc(1, sizeof(RULE));
+        if (!r) { log_line(L"内存不足"); return; }
+        lstrcpynW(r->record, record, 256);
+        r->port = port;
+        r->enabled = TRUE;
+        r->listenSock = INVALID_SOCKET;
+        g_rules[g_ruleCount] = r;
+        g_ruleCount++;
+    }
+    config_save();
+    refresh_list();
+    log_line(L"已添加规则: %s -> 127.0.0.1:%d", record, port);
+}
+
+static void on_delete(void)
+{
+    int sel;
+    if (!g_lbRules) return;
+    sel = (int)SendMessageW(g_lbRules, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= g_ruleCount) { log_line(L"请先在列表里选中一条规则"); return; }
+
+    {
+        RULE *r = g_rules[sel];
+        rule_stop(r);
+        log_line(L"已删除规则: %s :%d", r->record, r->port);
+        free(r);
+    }
+    memmove(&g_rules[sel], &g_rules[sel + 1], (size_t)(g_ruleCount - sel - 1) * sizeof(RULE *));
+    g_ruleCount--;
+    config_save();
+    refresh_list();
+}
+
+static int selected_rule(void)
+{
+    int sel;
+    if (!g_lbRules) return -1;
+    sel = (int)SendMessageW(g_lbRules, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= g_ruleCount) return -1;
+    return sel;
+}
+
+static void on_set_enabled(BOOL enable)
+{
+    int sel = selected_rule();
+    RULE *r;
+
+    if (sel < 0) { log_line(L"请先在列表里选中一条规则"); return; }
+    r = g_rules[sel];
+    r->enabled = enable;
+    if (enable) {
+        if (!r->thread) rule_start(r);
+        log_line(L"已启用: %s :%d", r->record, r->port);
+    } else {
+        rule_stop(r);
+        log_line(L"已停用: %s :%d", r->record, r->port);
+    }
+    config_save();
+    refresh_list();
+}
+
+static void on_start_all(void)
+{
+    int i, n = 0;
+    for (i = 0; i < g_ruleCount; i++) {
+        if (g_rules[i]->enabled && !g_rules[i]->thread) { rule_start(g_rules[i]); n++; }
+    }
+    log_line(L"启动 %d 条规则", n);
+    refresh_list();
+}
+
+static void on_stop_all(void)
+{
+    int i;
+    for (i = 0; i < g_ruleCount; i++) rule_stop(g_rules[i]);
+    log_line(L"已停止全部规则");
+    refresh_list();
+}
+
+static void update_status_text(void)
+{
+    WCHAR buf[64];
+    int running = 0, i;
+    for (i = 0; i < g_ruleCount; i++) {
+        if (g_rules[i]->thread && g_rules[i]->running) running++;
+    }
+    _snwprintf(buf, 64, L"%d/%d 运行", running, g_ruleCount);
+    SetWindowTextW(g_lbStatus, buf);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE:
+        g_hwnd = hwnd;
+        build_ui();
+        SetTimer(hwnd, IDT_REFRESH, 2000, NULL);
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == IDT_REFRESH) {
+            update_status_text();
+            refresh_list();
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_BT_ADD:
+            on_add();
+            return 0;
+        case IDC_BT_ENABLE:
+            on_set_enabled(TRUE);
+            return 0;
+        case IDC_BT_DISABLE:
+            on_set_enabled(FALSE);
+            return 0;
+        case IDC_BT_DEL:
+            on_delete();
+            return 0;
+        case IDC_BT_START:
+            on_start_all();
+            return 0;
+        case IDC_BT_STOP:
+            on_stop_all();
+            return 0;
+        case IDC_CK_AUTO:
+            g_autoStart = (SendMessageW(g_ckAuto, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            config_save();
+            return 0;
+        case IDC_LB_RULES:
+            if (HIWORD(wParam) == LBN_DBLCLK) {
+                int sel = selected_rule();
+                if (sel >= 0) on_set_enabled(!g_rules[sel]->enabled);
+            }
+            return 0;
+        }
+        return 0;
+
+    case WM_APP_LOG: {
+        WCHAR *copy = NULL;
+        EnterCriticalSection(&g_lock);
+        if (g_logBuf) {
+            size_t len = wcslen(g_logBuf);
+            copy = (WCHAR *)malloc((len + 1) * sizeof(WCHAR));
+            if (copy) wcscpy(copy, g_logBuf);
+        }
+        LeaveCriticalSection(&g_lock);
+        if (copy && g_edLog) {
+            SetWindowTextW(g_edLog, copy);
+            SendMessageW(g_edLog, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+            SendMessageW(g_edLog, EM_SCROLLCARET, 0, 0);
+            free(copy);
+        }
+        return 0;
+    }
+
+    case WM_APP_STATE:
+        update_status_text();
+        refresh_list();
+        return 0;
+
+    case WM_CLOSE:
+        on_stop_all();
+        config_save();
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, IDT_REFRESH);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
+{
+    WNDCLASSEXW wc;
+    HWND hwnd;
+    MSG msg;
+    WSADATA wsa;
+    WCHAR exe[MAX_PATH];
+
+    (void)prev;
+    (void)cmdline;
+    g_inst = inst;
+
+    InitializeCriticalSection(&g_lock);
+
+    {
+        HMODULE user32 = LoadLibraryW(L"user32.dll");
+        if (user32) {
+            typedef BOOL (WINAPI *SETDPIAWARE)(void);
+            SETDPIAWARE p = (SETDPIAWARE)(void *)GetProcAddress(user32, "SetProcessDPIAware");
+            if (p) p();
+        }
+    }
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
+
+    /* ini 放 exe 旁边 */
+    {
+        DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+        WCHAR *slash;
+        if (n == 0 || n >= MAX_PATH) exe[0] = 0;
+        slash = wcsrchr(exe, L'\\');
+        if (slash) *slash = 0;
+        _snwprintf(g_iniPath, MAX_PATH - 1, L"%s\\txtmux.ini", exe);
+    }
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"TxtMuxWnd";
+    if (!RegisterClassExW(&wc)) return 1;
+
+    hwnd = CreateWindowExW(0, L"TxtMuxWnd", APP_TITLE,
+                           WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 640, 476,
+                           NULL, NULL, inst, NULL);
+    if (!hwnd) return 1;
+
+    config_load();
+    SetWindowTextW(g_ckAuto, L"启动时自动连接");
+    SendMessageW(g_ckAuto, BM_SETCHECK, g_autoStart ? BST_CHECKED : BST_UNCHECKED, 0);
+    refresh_list();
+    log_line(L"就绪：添加规则后点「启动全部」（最多 %d 条）", MAX_RULES);
+
+    ShowWindow(hwnd, show);
+    UpdateWindow(hwnd);
+
+    if (g_autoStart && g_ruleCount > 0) on_start_all();
+
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_logBuf) free(g_logBuf);
+    DeleteCriticalSection(&g_lock);
+    WSACleanup();
+    return 0;
+}
