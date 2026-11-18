@@ -550,8 +550,13 @@ static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int
     if (*port <= 0 || *port > 65535) return FALSE;
 
     while (*p == L' ' || *p == L'\t') p++;
-    if (*p == L'0') *enabled = FALSE;
-    else *enabled = TRUE;
+    {
+        /* 关键：把 enabled 这个 token 也消耗掉，否则下面会把 "1" 当成匹配域名 */
+        const WCHAR *e = p;
+        while (*e && *e != L' ' && *e != L'\t') e++;
+        *enabled = (p[0] == L'0') ? FALSE : TRUE;
+        p = e;
+    }
 
     /* 可选的第四段：匹配域名 */
     if (match && matchCch > 0) {
@@ -855,6 +860,7 @@ static void handle_proxy_client(SOCKET client)
             port = ((int)pb[0] << 8) | pb[1];
         }
 
+        log_line(L"[代理] 请求(SOCKS5) %s:%d", whost, port);
         upstream = dial_for(whost, port, &usedRule);
         if (upstream == INVALID_SOCKET) {
             char fail[10] = { 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
@@ -939,6 +945,7 @@ static void handle_proxy_client(SOCKET client)
         }
         if (!whost[0] || port <= 0) { closesocket(client); return; }
 
+        log_line(L"[代理] 请求(CONNECT) %s:%d", whost, port);
         upstream = dial_for(whost, port, &usedRule);
         if (upstream == INVALID_SOCKET) {
             const char *msg = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
