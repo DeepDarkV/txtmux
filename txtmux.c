@@ -65,6 +65,14 @@ typedef struct {
 
 static HINSTANCE g_inst;
 static HWND g_hwnd, g_edRecord, g_edPort, g_lbRules, g_edLog, g_lbStatus, g_ckAuto, g_edMatch;
+static HWND g_stRecord, g_stPort, g_stMatch;
+static HWND g_btAdd, g_btEnable, g_btDisable, g_btDel, g_btStart, g_btStop;
+static HFONT g_monoFont;
+static int g_dpi = 96;
+static BOOL g_logFollow = TRUE;        /* stuck to the last line unless the user scrolls away */
+static int  g_logLastFirst = -1;       /* first visible line right after our own scroll */
+static void log_scroll_bottom(void);                 /* system DPI: every layout number is multiplied by dpi/96 */
+static WCHAR g_logFilePath[MAX_PATH];
 static WCHAR g_iniPath[MAX_PATH];
 static CRITICAL_SECTION g_lock;
 static WCHAR *g_logBuf;
@@ -79,8 +87,217 @@ static volatile LONG g_shutdown = 0;           /* 退出时通知代理线程 */
 static BOOL host_match(const WCHAR *pattern, const WCHAR *host);
 static WCHAR g_upstream[128] = L"";            /* 上游代理，如 127.0.0.1:10809 */
 static BOOL g_upstreamBlock = FALSE;           /* 上游失败时：TRUE=拒绝，FALSE=直连 */
+static int  g_selRule = -1;                    /* 列表里选中并正在编辑的规则下标 */
+static BOOL g_sortChanged = FALSE;             /* 启动时有没有因为排序改过顺序 */
+
+static BOOL rule_sort(void);
 
 /* ---------- 日志 ---------- */
+
+/* Mirror a log line to txtmux.log next to the exe (UTF-8). The on-screen
+ * log is memory only, so without this there is no way to inspect it. */
+/* ---------- log splitting ----------
+ * The active log is always txtmux.log. When the day changes it is renamed to
+ * txtmux-YYYYMMDD[-n].log. When all txtmux-*.log files together exceed
+ * logMaxMB (default 1024) the oldest ones (by name = by date) are deleted
+ * until the total is back under the limit. */
+
+#define LOG_TOTAL_MB_DEFAULT 1024
+#define LOG_PRUNE_EVERY      256
+
+static WCHAR g_logDir[MAX_PATH];
+static char  g_logDate[16];
+static int   g_logMaxMB = LOG_TOTAL_MB_DEFAULT;
+static int   g_logLines;
+
+typedef struct {
+    WCHAR name[MAX_PATH];
+    ULONGLONG size;
+} LOG_ENTRY;
+
+static void log_today(char *out, int cch)
+{
+    SYSTEMTIME st;
+
+    GetLocalTime(&st);
+    _snprintf(out, (size_t)cch, "%04d%02d%02d", (int)st.wYear, (int)st.wMonth, (int)st.wDay);
+    out[cch - 1] = 0;
+}
+
+static BOOL log_file_date(const WCHAR *path, char *out, int cch)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    FILETIME local;
+    SYSTEMTIME st;
+
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return FALSE;
+    if (!FileTimeToLocalFileTime(&fad.ftLastWriteTime, &local)) return FALSE;
+    if (!FileTimeToSystemTime(&local, &st)) return FALSE;
+    _snprintf(out, (size_t)cch, "%04d%02d%02d", (int)st.wYear, (int)st.wMonth, (int)st.wDay);
+    out[cch - 1] = 0;
+    return TRUE;
+}
+
+static ULONGLONG log_file_size(const WCHAR *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return 0;
+    return ((ULONGLONG)fad.nFileSizeHigh << 32) | (ULONGLONG)fad.nFileSizeLow;
+}
+
+/* rename the active txtmux.log to txtmux-<date>[-n].log */
+static void log_rotate_active(const char *date)
+{
+    WCHAR wdate[16], target[MAX_PATH];
+    int n;
+
+    if (!g_logDir[0]) return;
+    MultiByteToWideChar(CP_ACP, 0, date, -1, wdate, 16);
+    for (n = 0; n < 1000; n++) {
+        if (n == 0) _snwprintf(target, MAX_PATH - 1, L"%s\\txtmux-%s.log", g_logDir, wdate);
+        else        _snwprintf(target, MAX_PATH - 1, L"%s\\txtmux-%s-%d.log", g_logDir, wdate, n);
+        if (GetFileAttributesW(target) == INVALID_FILE_ATTRIBUTES) break;
+    }
+    if (n >= 1000) return;
+    MoveFileExW(g_logFilePath, target, MOVEFILE_REPLACE_EXISTING);
+}
+
+static void log_prune(void)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    WCHAR pattern[MAX_PATH];
+    LOG_ENTRY *items;
+    int count = 0, i, j, cap = 512;
+    ULONGLONG total, limit;
+
+    if (!g_logDir[0] || g_logMaxMB <= 0) return;
+    limit = (ULONGLONG)g_logMaxMB * 1024ULL * 1024ULL;
+    items = (LOG_ENTRY *)calloc((size_t)cap, sizeof(LOG_ENTRY));
+    if (!items) return;
+
+    _snwprintf(pattern, MAX_PATH - 1, L"%s\\txtmux-*.log", g_logDir);
+    h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (count >= cap) break;
+            lstrcpynW(items[count].name, fd.cFileName, MAX_PATH);
+            items[count].size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            count++;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    /* names sort by YYYYMMDD, so name order is oldest first */
+    for (i = 1; i < count; i++) {
+        LOG_ENTRY tmp = items[i];
+        j = i - 1;
+        while (j >= 0 && wcscmp(items[j].name, tmp.name) > 0) {
+            items[j + 1] = items[j];
+            j--;
+        }
+        items[j + 1] = tmp;
+    }
+
+    total = log_file_size(g_logFilePath);
+    for (i = 0; i < count; i++) total += items[i].size;
+
+    for (i = 0; i < count && total > limit; i++) {
+        WCHAR full[MAX_PATH];
+        _snwprintf(full, MAX_PATH - 1, L"%s\\%s", g_logDir, items[i].name);
+        if (DeleteFileW(full)) total -= items[i].size;
+    }
+
+    /* only today's file is left and still over the limit: rename it so the
+     * next prune pass can delete it */
+    if (total > limit && log_file_size(g_logFilePath) > limit / 2) {
+        log_rotate_active(g_logDate);
+    }
+    free(items);
+}
+
+/* on day change: archive the old file, then prune the total size */
+static void log_ensure_today(void)
+{
+    char today[16];
+
+    if (!g_logDir[0]) return;
+    log_today(today, sizeof(today));
+    if (g_logDate[0] && strcmp(today, g_logDate) == 0) return;
+    if (g_logDate[0]) log_rotate_active(g_logDate);
+    lstrcpynA(g_logDate, today, (int)sizeof(g_logDate));
+    log_prune();
+}
+
+static void log_init(void)
+{
+    WCHAR *slash;
+    char filedate[16], today[16];
+
+    if (!g_logFilePath[0]) return;
+    lstrcpynW(g_logDir, g_logFilePath, MAX_PATH);
+    slash = wcsrchr(g_logDir, L'\\');
+    if (slash) *slash = 0;
+
+    g_logMaxMB = (int)GetPrivateProfileIntW(L"main", L"logMaxMB", LOG_TOTAL_MB_DEFAULT, g_iniPath);
+    if (g_logMaxMB < 0) g_logMaxMB = 0;
+
+    log_today(today, sizeof(today));
+    if (log_file_date(g_logFilePath, filedate, sizeof(filedate)) && strcmp(filedate, today) != 0) {
+        log_rotate_active(filedate);           /* archive a stale log left over from an earlier run */
+    }
+    lstrcpynA(g_logDate, today, (int)sizeof(g_logDate));
+    log_prune();
+}
+
+static void log_to_file(const WCHAR *line)
+{
+    char utf8[2048];
+    FILE *f;
+    int n;
+
+    if (!g_logFilePath[0]) return;
+    EnterCriticalSection(&g_lock);      /* several threads share one file: write the whole line under the lock */
+    log_ensure_today();
+    n = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, (int)sizeof(utf8) - 1, NULL, NULL);
+    if (n > 1) {
+        f = _wfopen(g_logFilePath, L"ab");
+        if (f) {
+            fwrite(utf8, 1, (size_t)(n - 1), f);
+            fwrite("\r\n", 1, 2, f);
+            fclose(f);
+        }
+    }
+    if (g_logMaxMB > 0 && ++g_logLines >= LOG_PRUNE_EVERY) {
+        g_logLines = 0;
+        log_prune();
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+/* scale a 96-dpi design value to the current system DPI */
+static int ui(int v)
+{
+    return MulDiv(v, g_dpi, 96);
+}
+
+static void set_bounds(HWND w, int x, int y, int cx, int cy)
+{
+    if (w) MoveWindow(w, x, y, cx, cy, TRUE);
+}
+
+static HFONT create_mono_font(int height)
+{
+    LOGFONTW lf;
+
+    ZeroMemory(&lf, sizeof(lf));
+    lf.lfHeight = -height;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    lstrcpynW(lf.lfFaceName, L"Consolas", LF_FACESIZE);
+    return CreateFontIndirectW(&lf);
+}
 
 static void log_line(const WCHAR *fmt, ...)
 {
@@ -112,6 +329,8 @@ static void log_line(const WCHAR *fmt, ...)
         }
     }
     LeaveCriticalSection(&g_lock);
+
+    log_to_file(line);
 
     if (g_hwnd) PostMessage(g_hwnd, WM_APP_LOG, 0, 0);
 }
@@ -551,11 +770,12 @@ static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int
 
     while (*p == L' ' || *p == L'\t') p++;
     {
-        /* 关键：把 enabled 这个 token 也消耗掉，否则下面会把 "1" 当成匹配域名 */
-        const WCHAR *e = p;
-        while (*e && *e != L' ' && *e != L'\t') e++;
+        /* consume the enabled token first, otherwise the match field below
+         * would read it ("1") instead of the domain. */
+        const WCHAR *tokEnd = p;
+        while (*tokEnd && *tokEnd != L' ' && *tokEnd != L'\t') tokEnd++;
         *enabled = (p[0] == L'0') ? FALSE : TRUE;
-        p = e;
+        p = tokEnd;
     }
 
     /* 可选的第四段：匹配域名 */
@@ -578,45 +798,12 @@ static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int
 static RULE *find_rule_for_host(const WCHAR *host)
 {
     int i;
-    BOOL changed;
 
-    /* 第一遍：显式 match 字段 → 入口域名 → 已缓存的目标域名 */
+    /* Only rules that carry a match host take part in proxy routing.
+     * A rule without one is a pure local-port forwarder (see README). */
     for (i = 0; i < g_ruleCount; i++) {
         RULE *r = g_rules[i];
-        WCHAR h[256];
-        int p = 0;
-        BOOL secure = FALSE;
-        const WCHAR *path = NULL;
-
         if (r->match[0] && host_match(r->match, host)) return r;
-        if (r->kind == 1 && parse_url(r->record, h, 256, &p, &secure, &path)) {
-            if (lstrcmpiW(h, host) == 0) return r;
-        }
-        EnterCriticalSection(&g_lock);
-        if (r->hasTarget && lstrcmpiW(r->targetHost, host) == 0) {
-            LeaveCriticalSection(&g_lock);
-            return r;
-        }
-        LeaveCriticalSection(&g_lock);
-    }
-
-    /* 第二遍：让 URL 规则先解析一次，再拿解析出来的目标域名比对
-     * （例如规则是 https://webdav.example.com/，浏览器访问的是 307 之后的
-     *   webdav.gw.example.com，只有解析过才知道是同一个服务） */
-    for (i = 0; i < g_ruleCount; i++) {
-        RULE *r = g_rules[i];
-        WCHAR th[256];
-        int tp = 0;
-
-        if (r->kind != 1) continue;
-        changed = FALSE;
-        if (!rule_target(r, th, &tp, &changed)) continue;
-        EnterCriticalSection(&g_lock);
-        if (r->hasTarget && lstrcmpiW(r->targetHost, host) == 0) {
-            LeaveCriticalSection(&g_lock);
-            return r;
-        }
-        LeaveCriticalSection(&g_lock);
     }
     return NULL;
 }
@@ -754,26 +941,20 @@ static void send_pac(SOCKET client)
 
     for (i = 0; i < g_ruleCount && used < (int)sizeof(body) - 400; i++) {
         RULE *r = g_rules[i];
-        WCHAR h[256];
-        int p = 0;
-        BOOL secure = FALSE;
-        const WCHAR *path = NULL;
         char hA[256];
 
-        if (r->kind == 1 && parse_url(r->record, h, 256, &p, &secure, &path)) {
-            WideCharToMultiByte(CP_ACP, 0, h, -1, hA, sizeof(hA), NULL, NULL);
+        /* only rules with a match host appear in the PAC: the others are
+         * local-port forwarders and are not dispatched by the browser */
+        if (!r->match[0]) continue;
+        WideCharToMultiByte(CP_ACP, 0, r->match, -1, hA, (int)sizeof(hA), NULL, NULL);
+        if (strchr(hA, '*'))
             used += _snprintf(body + used, sizeof(body) - used,
-                              "  if (host == \"%s\") return \"PROXY %s:%d;\";\r\n",
-                              hA, "127.0.0.1", g_proxyPort);
-        }
-        EnterCriticalSection(&g_lock);
-        if (r->hasTarget) {
-            WideCharToMultiByte(CP_ACP, 0, r->targetHost, -1, hA, sizeof(hA), NULL, NULL);
+                              "  if (shExpMatch(host, \"%s\")) return \"PROXY 127.0.0.1:%d;\";\r\n",
+                              hA, g_proxyPort);
+        else
             used += _snprintf(body + used, sizeof(body) - used,
-                              "  if (host == \"%s\") return \"PROXY %s:%d;\";\r\n",
-                              hA, "127.0.0.1", g_proxyPort);
-        }
-        LeaveCriticalSection(&g_lock);
+                              "  if (host == \"%s\") return \"PROXY 127.0.0.1:%d;\";\r\n",
+                              hA, g_proxyPort);
     }
 
     used += _snprintf(body + used, sizeof(body) - used, "  return \"%s\";\r\n}\r\n", head);
@@ -801,6 +982,94 @@ static BOOL read_exact(SOCKET s, char *buf, int len)
 }
 
 /* 处理一个代理连接：先看头一个字节区分 SOCKS5(0x05) 与 HTTP */
+/* Plain http:// forwarding: rewrite the absolute URL to origin-form, dial it
+ * the same way a CONNECT would (rule target / upstream / direct) and copy both
+ * directions. Returns TRUE when handled (a response was written), FALSE when
+ * this is not a plain-HTTP request we can handle. */
+static BOOL forward_plain_http(SOCKET client, const char *req, int used,
+                               const char *method, const char *url)
+{
+    WCHAR wurl[1024], whost[256];
+    const WCHAR *wpath = NULL;
+    char pathA[1024], hostA[256], out[8192];
+    char *hdr;
+    const char *p, *end;
+    int port = 0, hdrLen, outLen = 0, bodyLen, n;
+    BOOL secure = FALSE, usedRule = FALSE;
+    SOCKET up;
+
+    if (_strnicmp(url, "http://", 7) != 0) return FALSE;
+    MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 1024);
+    if (!parse_url(wurl, whost, 256, &port, &secure, &wpath) || secure) return FALSE;
+    WideCharToMultiByte(CP_ACP, 0, wpath, -1, pathA, (int)sizeof(pathA), NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, whost, -1, hostA, (int)sizeof(hostA), NULL, NULL);
+
+    /* target is this proxy itself: refuse, otherwise the request would loop
+     * through the upstream back into us */
+    if (port == g_proxyPort && (!_stricmp(hostA, "127.0.0.1") || !_stricmp(hostA, "localhost"))) {
+        const char *no = "HTTP/1.1 403 Forbidden\r\n\r\n";
+        send(client, no, (int)strlen(no), 0);
+        return TRUE;
+    }
+
+    hdr = strstr(req, "\r\n\r\n");
+    if (!hdr) return FALSE;
+    hdrLen = (int)(hdr - req) + 4;
+    bodyLen = used - hdrLen;
+    if (bodyLen < 0) bodyLen = 0;
+
+    log_line(L"[proxy] request(HTTP) %s:%d", whost, port);
+    up = dial_for(whost, port, &usedRule);
+    if (up == INVALID_SOCKET) {
+        const char *bad = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(client, bad, (int)strlen(bad), 0);
+        return TRUE;
+    }
+
+    /* request line becomes origin-form; headers are copied as-is (minus
+     * Proxy-Connection / Connection) and Connection: close is forced to keep
+     * the response framing simple */
+    n = _snprintf(out, sizeof(out), "%s %s HTTP/1.1\r\n", method, pathA);
+    outLen += (n > 0 && n < (int)sizeof(out)) ? n : 0;
+
+    p = strstr(req, "\r\n");
+    if (!p) { closesocket(up); return FALSE; }
+    p += 2;
+    end = req + hdrLen - 4;
+    while (p < end && outLen < (int)sizeof(out) - 4) {
+        const char *eol = strstr(p, "\r\n");
+        int len;
+        if (!eol || eol > end) break;
+        len = (int)(eol - p);
+        if (len > 0 && _strnicmp(p, "Proxy-Connection:", 17) != 0 &&
+            _strnicmp(p, "Connection:", 11) != 0) {
+            if (outLen + len + 2 < (int)sizeof(out)) {
+                memcpy(out + outLen, p, (size_t)len);
+                outLen += len;
+                out[outLen++] = '\r';
+                out[outLen++] = '\n';
+            }
+        }
+        p = eol + 2;
+    }
+    n = _snprintf(out + outLen, sizeof(out) - outLen, "Connection: close\r\n\r\n");
+    outLen += (n > 0 && n < (int)sizeof(out) - outLen) ? n : 0;
+
+    if (bodyLen > 0 && outLen + bodyLen < (int)sizeof(out)) {
+        memcpy(out + outLen, req + hdrLen, (size_t)bodyLen);
+        outLen += bodyLen;
+    }
+
+    if (send(up, out, outLen, 0) <= 0) {
+        const char *bad = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(client, bad, (int)strlen(bad), 0);
+        closesocket(up);
+        return TRUE;
+    }
+    bridge(client, up);
+    return TRUE;
+}
+
 static void handle_proxy_client(SOCKET client)
 {
     unsigned char first = 0;
@@ -815,22 +1084,21 @@ static void handle_proxy_client(SOCKET client)
         /* ---- SOCKS5 ---- */
         unsigned char buf[512];
         int nmethods, i;
-        unsigned char method = 0;
+        int offered = 0;
 
         if (!read_exact(client, (char *)buf, 1)) { closesocket(client); return; }
         nmethods = buf[0];
         for (i = 0; i < nmethods; i++) {
             if (!read_exact(client, (char *)buf, 1)) { closesocket(client); return; }
-            if (buf[0] == 0x00) method = 0x00;   /* 只支持 no-auth */
-            else if (!method) method = 0xFF;
+            if (buf[0] == 0x00) offered = 1;   /* only no-auth is supported */
         }
         {
             char resp[2];
             resp[0] = 0x05;
-            resp[1] = (char)(method ? method : 0xFF);
+            resp[1] = offered ? (char)0x00 : (char)0xFF;
             send(client, resp, 2, 0);
         }
-        if (!method) { closesocket(client); return; }
+        if (!offered) { closesocket(client); return; }
 
         if (!read_exact(client, (char *)buf, 4)) { closesocket(client); return; }
         if (buf[0] != 0x05 || buf[1] != 0x01) { closesocket(client); return; } /* 只支持 CONNECT */
@@ -860,7 +1128,7 @@ static void handle_proxy_client(SOCKET client)
             port = ((int)pb[0] << 8) | pb[1];
         }
 
-        log_line(L"[代理] 请求(SOCKS5) %s:%d", whost, port);
+        log_line(L"[proxy] request %s:%d", whost, port);
         upstream = dial_for(whost, port, &usedRule);
         if (upstream == INVALID_SOCKET) {
             char fail[10] = { 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
@@ -909,7 +1177,7 @@ static void handle_proxy_client(SOCKET client)
         if (!sp2) { closesocket(client); return; }
         *sp2 = 0;
 
-        if (_stricmp(line, "CONNECT") != 0) {
+        if (_strnicmp(line, "CONNECT ", 8) != 0) {
             char method[16], target[512];
             int mi = 0, ti = 0;
             char *sp;
@@ -925,9 +1193,12 @@ static void handle_proxy_client(SOCKET client)
             if (!_stricmp(method, "GET") &&
                 (strstr(target, "/proxy.pac") || !strcmp(target, "/"))) {
                 send_pac(client);
-            } else {
-                const char *msg = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-                send(client, msg, (int)strlen(msg), 0);
+            } else if (!forward_plain_http(client, req, used, method, target)) {
+                log_line(L"[proxy] rejected: unsupported request (405)");
+                {
+                    const char *msg = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+                    send(client, msg, (int)strlen(msg), 0);
+                }
             }
             closesocket(client);
             return;
@@ -945,7 +1216,7 @@ static void handle_proxy_client(SOCKET client)
         }
         if (!whost[0] || port <= 0) { closesocket(client); return; }
 
-        log_line(L"[代理] 请求(CONNECT) %s:%d", whost, port);
+        log_line(L"[proxy] request %s:%d", whost, port);
         upstream = dial_for(whost, port, &usedRule);
         if (upstream == INVALID_SOCKET) {
             const char *msg = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
@@ -1148,6 +1419,27 @@ static void config_save(void)
     }
 }
 
+/* Read an ini value, then cut any inline ";" comment and trailing blanks.
+ * GetPrivateProfileString keeps inline comments as part of the value, so
+ *   upstream=127.0.0.1:10808   ; note
+ * used to arrive as that whole string and broke the upstream handshake. */
+static DWORD ini_str(const WCHAR *section, const WCHAR *key, const WCHAR *def,
+                     WCHAR *buf, DWORD cch, const WCHAR *file)
+{
+    DWORD n;
+    WCHAR *semi;
+
+    n = GetPrivateProfileStringW(section, key, def, buf, cch, file);
+    semi = wcschr(buf, L';');
+    if (semi) *semi = 0;
+    n = (DWORD)wcslen(buf);
+    while (n > 0 && (buf[n - 1] == L' ' || buf[n - 1] == L'\t' ||
+                     buf[n - 1] == L'\r' || buf[n - 1] == L'\n')) {
+        buf[--n] = 0;
+    }
+    return n;
+}
+
 static void config_load(void)
 {
     WCHAR buf[512], key[32];
@@ -1156,15 +1448,15 @@ static void config_load(void)
     g_autoStart = GetPrivateProfileIntW(L"main", L"autostart", 1, g_iniPath) ? TRUE : FALSE;
     {
         WCHAR bindBuf[64];
-        GetPrivateProfileStringW(L"main", L"bind", L"127.0.0.1", bindBuf, 64, g_iniPath);
+        ini_str(L"main", L"bind", L"127.0.0.1", bindBuf, 64, g_iniPath);
         if (bindBuf[0]) lstrcpynW(g_bindAddr, bindBuf, 64);
     }
     g_proxyPort = GetPrivateProfileIntW(L"main", L"proxy", 0, g_iniPath);
     if (g_proxyPort < 0 || g_proxyPort > 65535) g_proxyPort = 0;
     {
         WCHAR mode[32];
-        GetPrivateProfileStringW(L"main", L"upstream", L"", g_upstream, 128, g_iniPath);
-        GetPrivateProfileStringW(L"main", L"upstreamFallback", L"direct", mode, 32, g_iniPath);
+        ini_str(L"main", L"upstream", L"", g_upstream, 128, g_iniPath);
+        ini_str(L"main", L"upstreamFallback", L"direct", mode, 32, g_iniPath);
         g_upstreamBlock = (_wcsicmp(mode, L"block") == 0);
     }
     count = GetPrivateProfileIntW(L"main", L"count", 0, g_iniPath);
@@ -1178,7 +1470,7 @@ static void config_load(void)
 
         _snwprintf(key, 32, L"rule%d", i + 1);
         buf[0] = 0;
-        GetPrivateProfileStringW(L"rules", key, L"", buf, 512, g_iniPath);
+        ini_str(L"rules", key, L"", buf, 512, g_iniPath);
         if (!parse_rule_line(buf, rec, 256, &port, &enabled, m, 256)) continue;
         {
             RULE *r = (RULE *)calloc(1, sizeof(RULE));
@@ -1192,6 +1484,7 @@ static void config_load(void)
             g_rules[g_ruleCount++] = r;
         }
     }
+    if (rule_sort()) g_sortChanged = TRUE;
 }
 
 /* ---------- 界面 ---------- */
@@ -1204,39 +1497,178 @@ static HWND mk(const WCHAR *cls, const WCHAR *text, DWORD style, int x, int y, i
     return c;
 }
 
+static void layout_ui(int cw, int ch)
+{
+    int pad = ui(18), row = ui(26), gap = ui(8), vgap = ui(10);
+    int y1 = ui(16);
+    int y2 = y1 + row + vgap;
+    int y3 = y2 + row + ui(14);
+    int addW = ui(86), portW = ui(62), portLabW = ui(56), recLabW = ui(78), matchLabW = ui(152);
+    int addX = cw - pad - addW;
+    int portX = addX - gap - portW;
+    int portLabX = portX - ui(2) - portLabW;
+    int recX = pad + recLabW;
+    int recW = portLabX - gap - recX;
+    int btnW = ui(80), btnGap = ui(6);
+    int btnY, listH, logY, logH, x;
+
+    if (!g_lbRules) return;
+    if (recW < ui(120)) recW = ui(120);
+
+    /* 第一行：记录名 + 本地端口 + 添加 */
+    set_bounds(g_stRecord, pad, y1 + ui(3), recLabW, ui(20));
+    set_bounds(g_edRecord, recX, y1, recW, row);
+    set_bounds(g_stPort, portLabX, y1 + ui(3), portLabW, ui(20));
+    set_bounds(g_edPort, portX, y1, portW, row);
+    set_bounds(g_btAdd, addX, y1, addW, row);
+
+    /* 第二行：匹配域名 */
+    set_bounds(g_stMatch, pad, y2 + ui(3), matchLabW, ui(20));
+    set_bounds(g_edMatch, pad + matchLabW, y2, cw - pad * 2 - matchLabW, row);
+
+    /* 底部：日志约占可用高度的 35%，按钮行在日志上方，列表吃掉剩余高度 */
+    logH = (ch - y3) * 35 / 100;
+    if (logH < ui(76)) logH = ui(76);
+    if (logH > ch - y3 - ui(150)) logH = ch - y3 - ui(150);
+    if (logH < ui(50)) logH = ui(50);
+    btnY = ch - pad - logH - vgap - row;
+    listH = btnY - vgap - y3;
+    if (listH < ui(60)) listH = ui(60);
+
+    set_bounds(g_lbRules, pad, y3, cw - pad * 2, listH);
+
+    x = pad;
+    set_bounds(g_btEnable, x, btnY, btnW, row);            x += btnW + btnGap;
+    set_bounds(g_btDisable, x, btnY, btnW, row);           x += btnW + btnGap;
+    set_bounds(g_btDel, x, btnY, ui(64), row);             x += ui(64) + btnGap;
+    set_bounds(g_btStart, x, btnY, btnW, row);             x += btnW + btnGap;
+    set_bounds(g_btStop, x, btnY, btnW, row);              x += btnW + btnGap;
+    {
+        int ckW = ui(126);
+        set_bounds(g_ckAuto, x, btnY + ui(2), ckW, row - ui(2));
+        x += ckW + ui(6);
+        set_bounds(g_lbStatus, x, btnY + ui(4), cw - pad - x, ui(20));
+    }
+
+    logY = ch - pad - logH;
+    set_bounds(g_edLog, pad, logY, cw - pad * 2, logH);
+    if (g_logFollow) log_scroll_bottom();     /* 窗口尺寸变了也继续贴底 */
+}
+
 static void build_ui(void)
 {
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    RECT rc;
 
-    mk(L"STATIC", L"TXT 记录", SS_LEFT, 18, 20, 76, 20, 0, font);
-    g_edRecord = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 96, 18, 300, 24, IDC_ED_RECORD, font);
+    g_monoFont = create_mono_font(ui(13));
+    if (!g_monoFont) g_monoFont = font;
 
-    mk(L"STATIC", L"本地端口", SS_LEFT, 404, 20, 56, 20, 0, font);
-    g_edPort = mk(L"EDIT", L"9000", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 462, 18, 56, 24, IDC_ED_PORT, font);
+    g_stRecord = mk(L"STATIC", L"TXT 记录", SS_LEFT, 0, 0, 10, 10, 0, font);
+    g_edRecord = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 0, 0, 10, 10, IDC_ED_RECORD, font);
+    g_stPort = mk(L"STATIC", L"本地端口", SS_LEFT, 0, 0, 10, 10, 0, font);
+    g_edPort = mk(L"EDIT", L"9000", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 0, 0, 10, 10, IDC_ED_PORT, font);
+    g_btAdd = mk(L"BUTTON", L"添加/修改", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_ADD, font);
+    g_stMatch = mk(L"STATIC", L"匹配域名(可选，支持 *)", SS_LEFT, 0, 0, 10, 10, 0, font);
+    g_edMatch = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 0, 0, 10, 10, IDC_ED_MATCH, font);
 
-    mk(L"BUTTON", L"添加", BS_PUSHBUTTON, 526, 18, 76, 26, IDC_BT_ADD, font);
+    g_lbRules = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                   0, 0, 10, 10, IDC_LB_RULES, g_monoFont);
 
-    mk(L"STATIC", L"匹配域名(可选，支持 *)", SS_LEFT, 18, 54, 148, 20, 0, font);
-    g_edMatch = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 172, 52, 430, 24, IDC_ED_MATCH, font);
+    g_btEnable = mk(L"BUTTON", L"启用所选", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_ENABLE, font);
+    g_btDisable = mk(L"BUTTON", L"停用所选", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_DISABLE, font);
+    g_btDel = mk(L"BUTTON", L"删除", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_DEL, font);
+    g_btStart = mk(L"BUTTON", L"全部启动", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_START, font);
+    g_btStop = mk(L"BUTTON", L"全部停止", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_STOP, font);
+    g_ckAuto = mk(L"BUTTON", L"启动时自动连接", BS_AUTOCHECKBOX, 0, 0, 10, 10, IDC_CK_AUTO, font);
+    g_lbStatus = mk(L"STATIC", L"", SS_LEFT, 0, 0, 10, 10, IDC_LB_STATUS, font);
 
-    g_lbRules = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 18, 86, 588, 168, IDC_LB_RULES, font);
+    /* 日志：多行只读，不折行（横向滚动），否则长行会被截断/回卷 */
+    g_edLog = mk(L"EDIT", L"",
+                 WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_HSCROLL |
+                 ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                 0, 0, 10, 10, IDC_ED_LOG, font);
 
-    mk(L"BUTTON", L"启用所选", BS_PUSHBUTTON, 18, 264, 78, 30, IDC_BT_ENABLE, font);
-    mk(L"BUTTON", L"停用所选", BS_PUSHBUTTON, 100, 264, 78, 30, IDC_BT_DISABLE, font);
-    mk(L"BUTTON", L"删除", BS_PUSHBUTTON, 182, 264, 64, 30, IDC_BT_DEL, font);
-    mk(L"BUTTON", L"全部启动", BS_PUSHBUTTON, 250, 264, 78, 30, IDC_BT_START, font);
-    mk(L"BUTTON", L"全部停止", BS_PUSHBUTTON, 332, 264, 78, 30, IDC_BT_STOP, font);
-    g_ckAuto = mk(L"BUTTON", L"启动时自动连接", BS_AUTOCHECKBOX, 420, 268, 120, 24, IDC_CK_AUTO, font);
-    g_lbStatus = mk(L"STATIC", L"", SS_LEFT, 548, 272, 58, 22, IDC_LB_STATUS, font);
+    GetClientRect(g_hwnd, &rc);
+    layout_ui(rc.right - rc.left, rc.bottom - rc.top);
+}
 
-    g_edLog = mk(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
-                 18, 304, 588, 150, IDC_ED_LOG, font);
+/* 排序权重：精确域名(0) → 通配(1) → 未写匹配域名(2，仅端口转发)
+ * 命中的是第一条匹配的规则，所以精确必须排在通配前面。 */
+static int rule_rank(const RULE *r)
+{
+    if (!r->match[0]) return 2;
+    return wcschr(r->match, L'*') ? 1 : 0;
+}
+
+static int rule_index_of(const RULE *r)
+{
+    int i;
+
+    for (i = 0; i < g_ruleCount; i++) {
+        if (g_rules[i] == r) return i;
+    }
+    return -1;
+}
+
+/* 稳定插入排序：只在权重更大时后移，同权重保持原有相对顺序 */
+static BOOL rule_sort(void)
+{
+    int i, j;
+    BOOL changed = FALSE;
+
+    for (i = 1; i < g_ruleCount; i++) {
+        RULE *cur = g_rules[i];
+        int rank = rule_rank(cur);
+
+        j = i - 1;
+        while (j >= 0 && rule_rank(g_rules[j]) > rank) {
+            g_rules[j + 1] = g_rules[j];
+            j--;
+        }
+        if (j != i - 1) {
+            g_rules[j + 1] = cur;
+            changed = TRUE;
+        }
+    }
+    return changed;
+}
+
+/* 把某条规则的参数填到顶部编辑栏；-1 表示清空 */
+static void list_show_rule(int idx)
+{
+    if (!g_edRecord) return;
+    if (idx < 0 || idx >= g_ruleCount) {
+        SetWindowTextW(g_edRecord, L"");
+        SetWindowTextW(g_edMatch, L"");
+        SetWindowTextW(g_edPort, L"");
+        return;
+    }
+    SetWindowTextW(g_edRecord, g_rules[idx]->record);
+    SetWindowTextW(g_edMatch, g_rules[idx]->match);
+    {
+        WCHAR portText[16];
+        _snwprintf(portText, 16, L"%d", g_rules[idx]->port);
+        SetWindowTextW(g_edPort, portText);
+    }
+}
+
+/* 列表选中变化：把这条规则读到编辑栏（清空选择就清空编辑栏） */
+static void on_select(void)
+{
+    int sel;
+
+    if (!g_lbRules) return;
+    sel = (int)SendMessageW(g_lbRules, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= g_ruleCount) sel = -1;
+    g_selRule = sel;
+    list_show_rule(sel);
 }
 
 static void on_add(void)
 {
     WCHAR record[256], portText[32], match[256];
     int port, i;
+    RULE *r;
 
     get_text(g_edRecord, record, 256);
     get_text(g_edMatch, match, 256);
@@ -1245,15 +1677,38 @@ static void on_add(void)
 
     if (!record[0]) { log_line(L"记录名不能为空"); return; }
     if (port <= 0 || port > 65535) { log_line(L"本地端口不合法"); return; }
-    if (g_ruleCount >= MAX_RULES) { log_line(L"最多 %d 条规则", MAX_RULES); return; }
+
+    r = (g_selRule >= 0 && g_selRule < g_ruleCount) ? g_rules[g_selRule] : NULL;
+    if (!r && g_ruleCount >= MAX_RULES) { log_line(L"最多 %d 条规则", MAX_RULES); return; }
 
     for (i = 0; i < g_ruleCount; i++) {
+        if (g_rules[i] == r) continue;
         if (g_rules[i]->port == port) { log_line(L"端口 %d 已被规则 #%d 使用", port, i + 1); return; }
-        if (lstrcmpiW(g_rules[i]->record, record) == 0) { log_line(L"记录 %s 已存在", record); return; }
+        /* 允许同一个 TXT/入口 被多条规则引用（例如同一网关的精确规则 + 通配规则），
+         * 只要求本地端口唯一；端口已经保证不会有两条一模一样的转发。 */
     }
 
-    {
-        RULE *r = (RULE *)calloc(1, sizeof(RULE));
+    if (r) {
+        /* 修改选中规则：端口或来源变了才重启监听线程 */
+        BOOL needRestart = (r->port != port) || (lstrcmpiW(r->record, record) != 0);
+        BOOL wasRunning = (r->thread != NULL);
+
+        if (wasRunning && needRestart) rule_stop(r);
+        lstrcpynW(r->record, record, 256);
+        lstrcpynW(r->match, match, 256);
+        r->kind = (!wcsncmp(record, L"http://", 7) || !wcsncmp(record, L"https://", 8)) ? 1 : 0;
+        r->port = port;
+        if (needRestart) {
+            EnterCriticalSection(&g_lock);
+            r->hasTarget = FALSE;
+            r->targetHost[0] = 0;
+            LeaveCriticalSection(&g_lock);
+        }
+        if (wasRunning && needRestart) rule_start(r);
+        log_line(L"已修改规则: %s :%d%s%s", record, port,
+                 match[0] ? L"  匹配 " : L"", match);
+    } else {
+        r = (RULE *)calloc(1, sizeof(RULE));
         if (!r) { log_line(L"内存不足"); return; }
         lstrcpynW(r->record, record, 256);
         lstrcpynW(r->match, match, 256);
@@ -1261,12 +1716,21 @@ static void on_add(void)
         r->port = port;
         r->enabled = TRUE;
         r->listenSock = INVALID_SOCKET;
-        g_rules[g_ruleCount] = r;
-        g_ruleCount++;
+        g_rules[g_ruleCount++] = r;
+        log_line(L"已添加规则: %s -> 127.0.0.1:%d%s%s", record, port,
+                 match[0] ? L"  匹配 " : L"", match);
     }
+
+    if (rule_sort()) log_line(L"已按「精确域名 → 通配 → 仅端口」调整了规则顺序");
+
+    g_selRule = rule_index_of(r);
     config_save();
     refresh_list();
-    log_line(L"已添加规则: %s -> 127.0.0.1:%d", record, port);
+    if (g_selRule >= 0) {
+        SendMessageW(g_lbRules, LB_SETCURSEL, (WPARAM)g_selRule, 0);
+        SendMessageW(g_lbRules, LB_SETCARETINDEX, (WPARAM)g_selRule, MAKELPARAM(FALSE, 0));
+    }
+    list_show_rule(g_selRule);
 }
 
 static void on_delete(void)
@@ -1284,8 +1748,10 @@ static void on_delete(void)
     }
     memmove(&g_rules[sel], &g_rules[sel + 1], (size_t)(g_ruleCount - sel - 1) * sizeof(RULE *));
     g_ruleCount--;
+    g_selRule = -1;
     config_save();
     refresh_list();
+    list_show_rule(-1);
 }
 
 static int selected_rule(void)
@@ -1345,6 +1811,91 @@ static void update_status_text(void)
     SetWindowTextW(g_lbStatus, buf);
 }
 
+/* Refresh the log view: follow new lines (pin to the bottom) unless the log
+ * control has the keyboard focus, in which case the user is reading/scrolling
+ * and the current top line plus selection are preserved. */
+static void log_scroll_bottom(void)
+{
+    int len;
+
+    if (!g_edLog) return;
+    len = GetWindowTextLengthW(g_edLog);
+    SendMessageW(g_edLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageW(g_edLog, EM_LINESCROLL, 0, (LPARAM)0x7FFF);
+    g_logLastFirst = (int)SendMessageW(g_edLog, EM_GETFIRSTVISIBLELINE, 0, 0);
+}
+
+static int edit_visible_lines(HWND h)
+{
+    HDC dc = GetDC(h);
+    TEXTMETRICW tm;
+    RECT rc;
+    HFONT old;
+    int hh, lines;
+
+    ZeroMemory(&tm, sizeof(tm));
+    old = (HFONT)SendMessageW(h, WM_GETFONT, 0, 0);
+    if (old) SelectObject(dc, old);
+    GetTextMetricsW(dc, &tm);
+    GetClientRect(h, &rc);
+    if (old) SelectObject(dc, old);
+    ReleaseDC(h, dc);
+
+    hh = tm.tmHeight > 0 ? tm.tmHeight : 16;
+    lines = (rc.bottom - rc.top) / hh;
+    return lines > 0 ? lines : 1;
+}
+
+static void refresh_log_view(void)
+{
+    static int lastLen = -1;
+    WCHAR *copy = NULL;
+    int total, follow, first, now, selStart = 0, selEnd = 0;
+
+    if (!g_edLog) return;
+    EnterCriticalSection(&g_lock);
+    if (g_logBuf) {
+        size_t len = wcslen(g_logBuf);
+        copy = (WCHAR *)malloc((len + 1) * sizeof(WCHAR));
+        if (copy) wcscpy(copy, g_logBuf);
+    }
+    LeaveCriticalSection(&g_lock);
+    if (!copy) return;
+
+    total = (int)wcslen(copy);
+    if (total == lastLen) {          /* nothing new */
+        free(copy);
+        return;
+    }
+    lastLen = total;
+
+    first = (int)SendMessageW(g_edLog, EM_GETFIRSTVISIBLELINE, 0, 0);
+    {
+        int lines = (int)SendMessageW(g_edLog, EM_GETLINECOUNT, 0, 0);
+
+        /* 用户自己往上滚了（首行比我们上次贴底的位置更靠前）→ 停止跟随 */
+        if (g_logLastFirst >= 0 && first + 1 < g_logLastFirst) g_logFollow = FALSE;
+        /* 又滚回底部 → 恢复跟随（留一点余量，可见行数只是估算） */
+        if (!g_logFollow && first + edit_visible_lines(g_edLog) + 2 >= lines) g_logFollow = TRUE;
+
+        follow = (GetFocus() != g_edLog) && g_logFollow;
+    }
+    SendMessageW(g_edLog, EM_GETSEL, (WPARAM)(DWORD_PTR)&selStart, (LPARAM)(DWORD_PTR)&selEnd);
+
+    SetWindowTextW(g_edLog, copy);
+    free(copy);
+
+    if (follow) {
+        log_scroll_bottom();          /* 光标放到末尾并滚到最后一行 */
+    } else {
+        /* 保持用户当前看的那一行（换文本会把视图复位到顶端），再恢复选区 */
+        SendMessageW(g_edLog, EM_SETSEL, (WPARAM)selStart, (LPARAM)selEnd);
+        now = (int)SendMessageW(g_edLog, EM_GETFIRSTVISIBLELINE, 0, 0);
+        if (first != now) SendMessageW(g_edLog, EM_LINESCROLL, 0, (LPARAM)(first - now));
+        g_logLastFirst = -1;
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -1360,6 +1911,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             refresh_list();
         }
         return 0;
+
+    case WM_SIZE:
+        if (g_lbRules) layout_ui(LOWORD(lParam), HIWORD(lParam));
+        return 0;
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mm = (MINMAXINFO *)lParam;
+        mm->ptMinTrackSize.x = ui(560);
+        mm->ptMinTrackSize.y = ui(430);
+        return 0;
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
@@ -1386,6 +1948,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             config_save();
             return 0;
         case IDC_LB_RULES:
+            if (HIWORD(wParam) == LBN_SELCHANGE) {
+                on_select();
+                return 0;
+            }
             if (HIWORD(wParam) == LBN_DBLCLK) {
                 int sel = selected_rule();
                 if (sel >= 0) on_set_enabled(!g_rules[sel]->enabled);
@@ -1394,23 +1960,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    case WM_APP_LOG: {
-        WCHAR *copy = NULL;
-        EnterCriticalSection(&g_lock);
-        if (g_logBuf) {
-            size_t len = wcslen(g_logBuf);
-            copy = (WCHAR *)malloc((len + 1) * sizeof(WCHAR));
-            if (copy) wcscpy(copy, g_logBuf);
-        }
-        LeaveCriticalSection(&g_lock);
-        if (copy && g_edLog) {
-            SetWindowTextW(g_edLog, copy);
-            SendMessageW(g_edLog, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-            SendMessageW(g_edLog, EM_SCROLLCARET, 0, 0);
-            free(copy);
-        }
+    case WM_APP_LOG:
+        refresh_log_view();
         return 0;
-    }
 
     case WM_APP_STATE:
         update_status_text();
@@ -1464,7 +2016,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         if (n == 0 || n >= MAX_PATH) exe[0] = 0;
         slash = wcsrchr(exe, L'\\');
         if (slash) *slash = 0;
+        _snwprintf(g_logFilePath, MAX_PATH - 1, L"%s\\txtmux.log", exe);
         _snwprintf(g_iniPath, MAX_PATH - 1, L"%s\\txtmux.ini", exe);
+    }
+
+    {
+        HDC screen = GetDC(NULL);
+        if (screen) {
+            g_dpi = GetDeviceCaps(screen, LOGPIXELSX);
+            ReleaseDC(NULL, screen);
+        }
+        if (g_dpi <= 0) g_dpi = 96;
     }
 
     ZeroMemory(&wc, sizeof(wc));
@@ -1477,16 +2039,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     if (!RegisterClassExW(&wc)) return 1;
 
     hwnd = CreateWindowExW(0, L"TxtMuxWnd", APP_TITLE,
-                           WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 640, 508,
+                           WS_OVERLAPPEDWINDOW,
+                           CW_USEDEFAULT, CW_USEDEFAULT, ui(648), ui(520),
                            NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
 
     config_load();
+    log_init();
     SetWindowTextW(g_ckAuto, L"启动时自动连接");
     SendMessageW(g_ckAuto, BM_SETCHECK, g_autoStart ? BST_CHECKED : BST_UNCHECKED, 0);
     refresh_list();
-    log_line(L"就绪：添加规则后点「启动全部」（最多 %d 条）", MAX_RULES);
+    log_line(L"就绪：点列表里的规则可修改，改完点「添加/修改」（最多 %d 条）", MAX_RULES);
+    if (g_sortChanged) log_line(L"规则已按「精确域名 → 通配 → 仅端口」自动排序");
 
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
