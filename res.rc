@@ -1,7 +1,10 @@
 #include <winver.h>
+
+1 ICON "txtmux.ico"
+
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -9,9 +12,11 @@ BEGIN
   BEGIN
     BLOCK "080404B0"
     BEGIN
-      VALUE "FileDescription", "openvpn txt wrapper"
-      VALUE "FileVersion", "1.0.0.0"
-      VALUE "ProductName", "ovpnwrap"
+      VALUE "FileDescription", "txtmux - TXT/URL multi-route forwarder"
+      VALUE "FileVersion", "1.1.0.0"
+      VALUE "ProductName", "txtmux"
+      VALUE "InternalName", "txtmux"
+      VALUE "OriginalFilename", "txtmux.exe"
     END
   END
   BLOCK "VarFileInfo"

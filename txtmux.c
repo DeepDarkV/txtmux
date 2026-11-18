@@ -16,6 +16,7 @@
 #include <windns.h>
 #include <winhttp.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,16 @@
 #define IDC_LB_RULES  2003
 #define IDC_ED_LOG    2004
 #define IDC_ED_MATCH  2007
+#define IDC_CK_RUN    2008
+#define IDC_CK_TRAY   2009
+
+#define IDM_SHOW      3001
+#define IDM_STARTALL  3002
+#define IDM_STOPALL   3003
+#define IDM_AUTORUN   3004
+#define IDM_QUIT      3005
+
+#define WM_TRAYMSG    (WM_APP + 20)
 #define IDC_LB_STATUS 2005
 #define IDC_CK_AUTO   2006
 #define IDC_BT_ADD    1001
@@ -65,6 +76,16 @@ typedef struct {
 
 static HINSTANCE g_inst;
 static HWND g_hwnd, g_edRecord, g_edPort, g_lbRules, g_edLog, g_lbStatus, g_ckAuto, g_edMatch;
+static HWND g_ckRun, g_ckTray;
+
+/* 自启动（HKCU\...\Run）与托盘 */
+static BOOL g_autoRunOn = FALSE;      /* 注册表里当前是否已设置开机自启 */
+static BOOL g_closeToTray = TRUE;     /* 关窗口时缩到托盘而不是退出（可关）*/
+static BOOL g_startMinimized = FALSE; /* 命令行 -min */
+static BOOL g_quitting = FALSE;       /* 正在真正退出，WM_CLOSE 不再缩托盘 */
+static HICON g_trayIcon = NULL;
+static BOOL g_trayShown = FALSE;
+static UINT g_msgTaskbarCreated = 0;  /* explorer.exe 重启后要重新加回托盘图标 */
 static HWND g_stRecord, g_stPort, g_stMatch;
 static HWND g_btAdd, g_btEnable, g_btDisable, g_btDel, g_btStart, g_btStop;
 static HFONT g_monoFont;
@@ -1399,6 +1420,7 @@ static void config_save(void)
     int i;
 
     WritePrivateProfileStringW(L"main", L"autostart", g_autoStart ? L"1" : L"0", g_iniPath);
+    WritePrivateProfileStringW(L"main", L"closeToTray", g_closeToTray ? L"1" : L"0", g_iniPath);
     _snwprintf(buf, 512, L"%d", g_ruleCount);
     WritePrivateProfileStringW(L"main", L"count", buf, g_iniPath);
 
@@ -1446,6 +1468,7 @@ static void config_load(void)
     int count, i;
 
     g_autoStart = GetPrivateProfileIntW(L"main", L"autostart", 1, g_iniPath) ? TRUE : FALSE;
+    g_closeToTray = GetPrivateProfileIntW(L"main", L"closeToTray", 1, g_iniPath) ? TRUE : FALSE;
     {
         WCHAR bindBuf[64];
         ini_str(L"main", L"bind", L"127.0.0.1", bindBuf, 64, g_iniPath);
@@ -1487,6 +1510,156 @@ static void config_load(void)
     if (rule_sort()) g_sortChanged = TRUE;
 }
 
+/* ---------- 开机自启（HKCU\Software\Microsoft\Windows\CurrentVersion\Run） ---------- */
+
+#define AUTORUN_KEY   L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define AUTORUN_VALUE L"txtmux"
+
+static BOOL autorun_get(void)
+{
+    HKEY k;
+    DWORD type = 0, size = 0;
+    BOOL on = FALSE;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, AUTORUN_KEY, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return FALSE;
+    if (RegQueryValueExW(k, AUTORUN_VALUE, NULL, &type, NULL, &size) == ERROR_SUCCESS && size > 0)
+        on = TRUE;
+    RegCloseKey(k);
+    return on;
+}
+
+static BOOL autorun_set(BOOL on)
+{
+    HKEY k;
+    LONG rc;
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, AUTORUN_KEY, 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return FALSE;
+
+    if (on) {
+        WCHAR exe[MAX_PATH], cmd[MAX_PATH + 16];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        /* -min：开机启动时直接缩到托盘，不弹窗口 */
+        _snwprintf(cmd, MAX_PATH + 15, L"\"%s\" -min", exe);
+        rc = RegSetValueExW(k, AUTORUN_VALUE, 0, REG_SZ,
+                            (const BYTE *)cmd, (DWORD)((lstrlenW(cmd) + 1) * sizeof(WCHAR)));
+    } else {
+        rc = RegDeleteValueW(k, AUTORUN_VALUE);
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+    }
+    RegCloseKey(k);
+    return rc == ERROR_SUCCESS;
+}
+
+/* ---------- 托盘图标 ---------- */
+
+/* 用 V1 结构（XP~Win11 都认），不用 NOTIFYICONDATAW 的新字段 */
+typedef struct {
+    DWORD cbSize;
+    HWND  hWnd;
+    UINT  uID;
+    UINT  uFlags;
+    UINT  uCallbackMessage;
+    HICON hIcon;
+    WCHAR szTip[64];
+} TRAYICON_V1;
+
+static int tray_running_count(void)
+{
+    int i, n = 0;
+    for (i = 0; i < g_ruleCount; i++)
+        if (g_rules[i]->thread && g_rules[i]->running) n++;
+    return n;
+}
+
+static void tray_update_tip(void)
+{
+    TRAYICON_V1 td;
+
+    if (!g_trayShown) return;
+    ZeroMemory(&td, sizeof(td));
+    td.cbSize = sizeof(td);
+    td.hWnd = g_hwnd;
+    td.uID = 1;
+    td.uFlags = NIF_TIP;
+    _snwprintf(td.szTip, 63, L"txtmux  %d/%d 运行", tray_running_count(), g_ruleCount);
+    Shell_NotifyIconW(NIM_MODIFY, (PNOTIFYICONDATAW)&td);
+}
+
+static void tray_add(void)
+{
+    TRAYICON_V1 td;
+
+    if (g_trayShown || !g_hwnd) return;
+    if (!g_trayIcon) {
+        int cx = GetSystemMetrics(SM_CXSMICON), cy = GetSystemMetrics(SM_CYSMICON);
+        if (cx <= 0) cx = 16;
+        if (cy <= 0) cy = 16;
+        g_trayIcon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                       cx, cy, LR_DEFAULTCOLOR);
+        if (!g_trayIcon) g_trayIcon = LoadIconW(NULL, IDI_APPLICATION);
+    }
+    ZeroMemory(&td, sizeof(td));
+    td.cbSize = sizeof(td);
+    td.hWnd = g_hwnd;
+    td.uID = 1;
+    td.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    td.uCallbackMessage = WM_TRAYMSG;
+    td.hIcon = g_trayIcon;
+    _snwprintf(td.szTip, 63, L"txtmux  %d/%d 运行", tray_running_count(), g_ruleCount);
+    if (Shell_NotifyIconW(NIM_ADD, (PNOTIFYICONDATAW)&td)) g_trayShown = TRUE;
+}
+
+static void tray_remove(void)
+{
+    TRAYICON_V1 td;
+
+    if (!g_trayShown) return;
+    ZeroMemory(&td, sizeof(td));
+    td.cbSize = sizeof(td);
+    td.hWnd = g_hwnd;
+    td.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, (PNOTIFYICONDATAW)&td);
+    g_trayShown = FALSE;
+}
+
+static void show_main_window(void)
+{
+    ShowWindow(g_hwnd, SW_SHOW);
+    ShowWindow(g_hwnd, SW_RESTORE);
+    SetForegroundWindow(g_hwnd);
+}
+
+static void hide_to_tray(void)
+{
+    tray_add();
+    ShowWindow(g_hwnd, SW_HIDE);
+    log_line(L"已最小化到托盘（双击图标恢复，右键菜单可退出）");
+}
+
+static void tray_menu(void)
+{
+    HMENU m = CreatePopupMenu();
+    POINT pt;
+
+    if (!m) return;
+    AppendMenuW(m, MF_STRING, IDM_SHOW, L"显示主窗口");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_STARTALL, L"启动全部规则");
+    AppendMenuW(m, MF_STRING, IDM_STOPALL, L"停止全部规则");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (g_autoRunOn ? MF_CHECKED : 0), IDM_AUTORUN, L"开机自启");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_QUIT, L"退出");
+
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_hwnd);           /* 不设前台菜单不会自动消失 */
+    TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(m);
+}
+
 /* ---------- 界面 ---------- */
 
 static HWND mk(const WCHAR *cls, const WCHAR *text, DWORD style, int x, int y, int w, int h, int id, HFONT font)
@@ -1510,7 +1683,7 @@ static void layout_ui(int cw, int ch)
     int recX = pad + recLabW;
     int recW = portLabX - gap - recX;
     int btnW = ui(80), btnGap = ui(6);
-    int btnY, listH, logY, logH, x;
+    int btnY, toggleY, listH, logY, logH, x;
 
     if (!g_lbRules) return;
     if (recW < ui(120)) recW = ui(120);
@@ -1532,7 +1705,8 @@ static void layout_ui(int cw, int ch)
     if (logH > ch - y3 - ui(150)) logH = ch - y3 - ui(150);
     if (logH < ui(50)) logH = ui(50);
     btnY = ch - pad - logH - vgap - row;
-    listH = btnY - vgap - y3;
+    toggleY = btnY - ui(4) - row;
+    listH = toggleY - vgap - y3;
     if (listH < ui(60)) listH = ui(60);
 
     set_bounds(g_lbRules, pad, y3, cw - pad * 2, listH);
@@ -1549,6 +1723,9 @@ static void layout_ui(int cw, int ch)
         x += ckW + ui(6);
         set_bounds(g_lbStatus, x, btnY + ui(4), cw - pad - x, ui(20));
     }
+
+    set_bounds(g_ckRun, pad, toggleY, ui(96), row);
+    set_bounds(g_ckTray, pad + ui(104), toggleY, ui(210), row);
 
     logY = ch - pad - logH;
     set_bounds(g_edLog, pad, logY, cw - pad * 2, logH);
@@ -1580,6 +1757,8 @@ static void build_ui(void)
     g_btStart = mk(L"BUTTON", L"全部启动", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_START, font);
     g_btStop = mk(L"BUTTON", L"全部停止", BS_PUSHBUTTON, 0, 0, 10, 10, IDC_BT_STOP, font);
     g_ckAuto = mk(L"BUTTON", L"启动时自动连接", BS_AUTOCHECKBOX, 0, 0, 10, 10, IDC_CK_AUTO, font);
+    g_ckRun = mk(L"BUTTON", L"开机自启", BS_AUTOCHECKBOX, 0, 0, 10, 10, IDC_CK_RUN, font);
+    g_ckTray = mk(L"BUTTON", L"关闭时最小化到托盘", BS_AUTOCHECKBOX, 0, 0, 10, 10, IDC_CK_TRAY, font);
     g_lbStatus = mk(L"STATIC", L"", SS_LEFT, 0, 0, 10, 10, IDC_LB_STATUS, font);
 
     /* 日志：多行只读，不折行（横向滚动），否则长行会被截断/回卷 */
@@ -1898,6 +2077,14 @@ static void refresh_log_view(void)
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    /* explorer.exe 重启后会广播 TaskbarCreated，托盘图标要重新加回去 */
+    if (g_msgTaskbarCreated != 0 && msg == g_msgTaskbarCreated) {
+        g_trayShown = FALSE;
+        if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = NULL; }
+        tray_add();
+        return 0;
+    }
+
     switch (msg) {
     case WM_CREATE:
         g_hwnd = hwnd;
@@ -1919,7 +2106,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO *)lParam;
         mm->ptMinTrackSize.x = ui(560);
-        mm->ptMinTrackSize.y = ui(430);
+        mm->ptMinTrackSize.y = ui(470);
         return 0;
     }
 
@@ -1947,6 +2134,45 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_autoStart = (SendMessageW(g_ckAuto, BM_GETCHECK, 0, 0) == BST_CHECKED);
             config_save();
             return 0;
+        case IDC_CK_RUN:
+            g_autoRunOn = (SendMessageW(g_ckRun, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (autorun_set(g_autoRunOn)) {
+                log_line(g_autoRunOn ? L"已设置开机自启（启动时缩到托盘）" : L"已取消开机自启");
+            } else {
+                g_autoRunOn = !g_autoRunOn;
+                SendMessageW(g_ckRun, BM_SETCHECK, g_autoRunOn ? BST_CHECKED : BST_UNCHECKED, 0);
+                log_line(L"设置开机自启失败（注册表不可写？）");
+            }
+            config_save();
+            return 0;
+        case IDC_CK_TRAY:
+            g_closeToTray = (SendMessageW(g_ckTray, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            config_save();
+            log_line(g_closeToTray ? L"关闭窗口时最小化到托盘" : L"关闭窗口时直接退出");
+            return 0;
+        case IDM_SHOW:
+            show_main_window();
+            return 0;
+        case IDM_STARTALL:
+            on_start_all();
+            tray_update_tip();
+            return 0;
+        case IDM_STOPALL:
+            on_stop_all();
+            tray_update_tip();
+            return 0;
+        case IDM_AUTORUN:
+            g_autoRunOn = !g_autoRunOn;
+            autorun_set(g_autoRunOn);
+            if (g_ckRun)
+                SendMessageW(g_ckRun, BM_SETCHECK, g_autoRunOn ? BST_CHECKED : BST_UNCHECKED, 0);
+            config_save();
+            log_line(g_autoRunOn ? L"已设置开机自启（启动时缩到托盘）" : L"已取消开机自启");
+            return 0;
+        case IDM_QUIT:
+            g_quitting = TRUE;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
         case IDC_LB_RULES:
             if (HIWORD(wParam) == LBN_SELCHANGE) {
                 on_select();
@@ -1960,6 +2186,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
+    case WM_TRAYMSG:
+        if (LOWORD(lParam) == WM_LBUTTONDBLCLK || LOWORD(lParam) == WM_LBUTTONUP) {
+            show_main_window();
+            return 0;
+        }
+        if (LOWORD(lParam) == WM_RBUTTONUP) {
+            tray_menu();
+            return 0;
+        }
+        return 0;
+
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_MINIMIZE) {
+            hide_to_tray();
+            return 0;
+        }
+        break;
+
     case WM_APP_LOG:
         refresh_log_view();
         return 0;
@@ -1967,17 +2211,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_APP_STATE:
         update_status_text();
         refresh_list();
+        tray_update_tip();
         return 0;
 
     case WM_CLOSE:
+        if (!g_quitting && g_closeToTray) {
+            hide_to_tray();
+            return 0;
+        }
         on_stop_all();
         InterlockedExchange(&g_shutdown, 1);
         config_save();
+        tray_remove();
         DestroyWindow(hwnd);
         return 0;
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_REFRESH);
+        tray_remove();
         PostQuitMessage(0);
         return 0;
     }
@@ -1993,8 +2244,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     WCHAR exe[MAX_PATH];
 
     (void)prev;
-    (void)cmdline;
     g_inst = inst;
+    g_startMinimized = (cmdline && wcsstr(cmdline, L"-min")) ? TRUE : FALSE;
 
     InitializeCriticalSection(&g_lock);
 
@@ -2020,6 +2271,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         _snwprintf(g_iniPath, MAX_PATH - 1, L"%s\\txtmux.ini", exe);
     }
 
+    /* 单实例：已有实例在跑（可能正缩在托盘里）就把它的窗口叫到前面，
+       否则重复双击 exe 会出现第二个进程抢同一个代理端口 */
+    {
+        HANDLE mtx = CreateMutexW(NULL, FALSE, L"Local\\txtmux_single_instance");
+        if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+            HWND exist = FindWindowW(L"TxtMuxWnd", NULL);
+            if (exist) {
+                ShowWindow(exist, SW_SHOW);
+                ShowWindow(exist, SW_RESTORE);
+                SetForegroundWindow(exist);
+            }
+            return 0;
+        }
+    }
+
     {
         HDC screen = GetDC(NULL);
         if (screen) {
@@ -2036,6 +2302,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"TxtMuxWnd";
+    wc.hIcon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0,
+                                 LR_DEFAULTSIZE | LR_DEFAULTCOLOR);
+    if (!wc.hIcon) wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                                   LR_DEFAULTCOLOR);
+    g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     if (!RegisterClassExW(&wc)) return 1;
 
     hwnd = CreateWindowExW(0, L"TxtMuxWnd", APP_TITLE,
@@ -2046,14 +2319,24 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 
     config_load();
     log_init();
+    g_autoRunOn = autorun_get();
     SetWindowTextW(g_ckAuto, L"启动时自动连接");
     SendMessageW(g_ckAuto, BM_SETCHECK, g_autoStart ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_ckRun)
+        SendMessageW(g_ckRun, BM_SETCHECK, g_autoRunOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_ckTray)
+        SendMessageW(g_ckTray, BM_SETCHECK, g_closeToTray ? BST_CHECKED : BST_UNCHECKED, 0);
     refresh_list();
     log_line(L"就绪：点列表里的规则可修改，改完点「添加/修改」（最多 %d 条）", MAX_RULES);
     if (g_sortChanged) log_line(L"规则已按「精确域名 → 通配 → 仅端口」自动排序");
 
-    ShowWindow(hwnd, show);
-    UpdateWindow(hwnd);
+    tray_add();                     /* 常驻托盘，最小化/关闭后还能从图标恢复 */
+    if (!g_startMinimized) {
+        ShowWindow(hwnd, show);
+        UpdateWindow(hwnd);
+    } else {
+        log_line(L"以最小化方式启动（-min），托盘图标可恢复窗口");
+    }
 
     if (g_proxyPort > 0) proxy_start();
     if (g_autoStart && g_ruleCount > 0) on_start_all();

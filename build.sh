@@ -11,7 +11,7 @@ RC64=${RC64:-x86_64-w64-mingw32-windres}
 RC32=${RC32:-i686-w64-mingw32-windres}
 
 CFLAGS="-O2 -Wall -Wextra -municode -mwindows -static -static-libgcc -std=gnu99 -D_WIN32_WINNT=0x0501"
-LIBS="-lws2_32 -ldnsapi -lcomctl32 -lwinhttp"
+LIBS="-lws2_32 -ldnsapi -lcomctl32 -lwinhttp -lshell32 -ladvapi32"
 
 if command -v "$CC64" >/dev/null 2>&1; then
     if command -v "$RC64" >/dev/null 2>&1; then
