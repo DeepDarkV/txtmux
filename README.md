@@ -91,6 +91,16 @@ proxy=8080
 - 已建立的连接不会被重新解析打断，只有新连接才用新地址
 - TXT 值必须是 `host:port` 或 `[ipv6]:port`；目标建连目前走 IPv4
 
+## 安卓版
+
+`android/` 下是同一套功能的安卓移植：**普通 APK，不需要 root，也不需要 LSPosed**。
+TXT 查询、入口 URL 跟随 307、本地端口转发、HTTP CONNECT / SOCKS5 / 明文 HTTP 代理、PAC、
+上游链式转发、日志落盘都已实现；构建与用法见 `android/README.md`。
+
+```sh
+cd android && sh build.sh    # 输出 txtmux-android.apk
+```
+
 ## 编译
 
 ```sh
