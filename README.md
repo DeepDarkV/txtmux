@@ -38,7 +38,10 @@ v2rayN 的 `bin/config.json` 每次启动都会重新生成，手改无效。改
 - Windows 代理设为 `127.0.0.1:8080`
 - txtmux：`proxy=8080`、`upstream=127.0.0.1:10809`
 
-命中规则 → 直连真实端点；其余 → CONNECT 转给 v2rayN。配了 upstream 时上游失败不退回直连。
+命中规则 → 直连真实端点；其余 → CONNECT 转给 v2rayN。
+
+- 跟随 307 必须用 **WinHTTP 直连**（NO_PROXY）：系统代理若是 txtmux 自己，走代理会自指死循环
+- `upstreamFallback=direct|block`（默认 direct）：上游挂掉时退回直连还是拒绝
 
 ### 和 v2rayN 共存（PAC 方式）
 

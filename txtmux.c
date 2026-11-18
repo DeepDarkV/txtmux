@@ -77,7 +77,8 @@ static int g_proxyPort = 0;                    /* >0 时额外起 HTTP/SOCKS5 �
 static volatile LONG g_shutdown = 0;           /* 退出时通知代理线程 */
 
 static BOOL host_match(const WCHAR *pattern, const WCHAR *host);
-static WCHAR g_upstream[128] = L"";            /* PAC 兜底代理，如 127.0.0.1:10809 */
+static WCHAR g_upstream[128] = L"";            /* 上游代理，如 127.0.0.1:10809 */
+static BOOL g_upstreamBlock = FALSE;           /* 上游失败时：TRUE=拒绝，FALSE=直连 */
 
 /* ---------- 日志 ---------- */
 
@@ -250,9 +251,14 @@ static BOOL fetch_final_url(const WCHAR *url, WCHAR *out, int outCch)
 
     if (!parse_url(url, host, 256, &port, &secure, &path)) return FALSE;
 
-    session = WinHttpOpen(L"txtmux/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    /* 关键：不能用 DEFAULT_PROXY。系统代理很可能就是本程序自己，
+     * 那样跟随 307 的请求会打回 127.0.0.1 形成自指循环，解析永远失败。 */
+    session = WinHttpOpen(L"txtmux/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) return FALSE;
+    if (!session) {
+        log_line(L"WARN WinHTTP 初始化失败: %lu", GetLastError());
+        return FALSE;
+    }
 
     conn = WinHttpConnect(session, host, (INTERNET_PORT)port, 0);
     if (conn) {
@@ -278,6 +284,7 @@ static BOOL fetch_final_url(const WCHAR *url, WCHAR *out, int outCch)
         WinHttpCloseHandle(conn);
     }
     WinHttpCloseHandle(session);
+    if (!ok) log_line(L"WARN 跟随跳转失败: %s（WinHTTP 错误 %lu）", url, GetLastError());
     return ok;
 }
 
@@ -621,8 +628,21 @@ static SOCKET dial_via_upstream(const WCHAR *host, int port)
     if (!g_upstream[0]) return INVALID_SOCKET;
 
     WideCharToMultiByte(CP_ACP, 0, g_upstream, -1, upA, sizeof(upA), NULL, NULL);
+    {
+        char *prefix = upA;
+        if (!_strnicmp(prefix, "http://", 7)) prefix += 7;
+        else if (!_strnicmp(prefix, "socks5://", 9)) prefix += 9;
+        if (prefix != upA) memmove(upA, prefix, strlen(prefix) + 1);
+    }
     colon = strrchr(upA, ':');
-    if (!colon) return INVALID_SOCKET;
+    if (!colon) {
+        /* 只写了端口：默认本机 */
+        char onlyPort[32];
+        lstrcpynA(onlyPort, upA, sizeof(onlyPort));
+        _snprintf(upA, sizeof(upA), "127.0.0.1:%s", onlyPort);
+        colon = strrchr(upA, ':');
+        if (!colon) return INVALID_SOCKET;
+    }
     *colon = 0;
 
     WideCharToMultiByte(CP_ACP, 0, host, -1, hostA, sizeof(hostA), NULL, NULL);
@@ -684,7 +704,8 @@ static SOCKET dial_for(const WCHAR *host, int port, BOOL *usedRule)
     if (!*usedRule) {
         SOCKET viaProxy = dial_via_upstream(host, port);
         if (viaProxy != INVALID_SOCKET) return viaProxy;
-        if (g_upstream[0]) return INVALID_SOCKET;   /* 配了上游就走上游，失败也不直连 */
+        if (g_upstream[0] && g_upstreamBlock) return INVALID_SOCKET;
+        if (g_upstream[0]) log_line(L"WARN 上游 %s 不可用，改为直连 %s:%d", g_upstream, host, port);
         lstrcpynW(targetHost, host, 256);
     }
 
@@ -1133,7 +1154,12 @@ static void config_load(void)
     }
     g_proxyPort = GetPrivateProfileIntW(L"main", L"proxy", 0, g_iniPath);
     if (g_proxyPort < 0 || g_proxyPort > 65535) g_proxyPort = 0;
-    GetPrivateProfileStringW(L"main", L"upstream", L"", g_upstream, 128, g_iniPath);
+    {
+        WCHAR mode[32];
+        GetPrivateProfileStringW(L"main", L"upstream", L"", g_upstream, 128, g_iniPath);
+        GetPrivateProfileStringW(L"main", L"upstreamFallback", L"direct", mode, 32, g_iniPath);
+        g_upstreamBlock = (_wcsicmp(mode, L"block") == 0);
+    }
     count = GetPrivateProfileIntW(L"main", L"count", 0, g_iniPath);
     if (count > MAX_RULES) count = MAX_RULES;
 
