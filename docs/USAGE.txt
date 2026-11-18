@@ -101,6 +101,38 @@ rule4=https://webdav.example.com/   8445  1  *.gw.example.com
 - v2ray 那边的路由可以写宽（`domain:gw.example.com`）：命中的走 txtmux，
   没命中的 txtmux 会**直接直连**（出站按目标自身的 A/AAAA 选择，IPv6 不会被降级）
 
+### 把 txtmux 当系统代理（链式到 v2rayN，全机生效）
+
+v2rayN 的 `bin/config.json` 是它每次启动重新生成的，**手改一定会被覆盖**；它的界面里也不方便
+加自定义出站。所以换个方向：让 txtmux 占系统代理，未命中的流量**链式交给 v2rayN**。
+
+1. v2rayN：关掉「自动配置系统代理」（参数设置里），别让它再抢系统代理
+2. Windows：设置 → 网络和 Internet → 代理 → 手动设置 → `127.0.0.1:8080`
+3. txtmux 的 ini：
+
+   ```ini
+   [main]
+   proxy=8080
+   upstream=127.0.0.1:10809        ; v2rayN 的 HTTP 入站（不是 SOCKS 的 10808）
+   bind=127.0.0.1
+   [rules]
+   rule1=https://webdav.example.com/ 8443 1 webdav.gw.example.com
+   ```
+
+效果：
+
+- 命中规则的域名（webdav）→ txtmux 直连真实 STUN 端点，无 307
+- **其他所有域名** → txtmux 用 CONNECT 转给 `upstream`（v2rayN），照旧走代理，全机的程序都适用
+- 不再依赖 PAC，也不用改 v2ray 的任何配置
+
+注意：
+
+- 配了 `upstream` 后，**上游不可用时不会退回直连**（避免本该走代理的流量泄漏），会返回 502 并记日志
+- 想让"未命中的直接直连"就留空 `upstream`
+- v2rayN 用 TUN 模式时，回环地址（127.0.0.1）一般不会被 TUN 接管，上面这套照常工作；
+  但 txtmux 直连真实端点的那条出站会被 TUN 捕获，如果它绕远了，就在 v2ray 路由里给
+  目标 IP 加 `direct`
+
 ### 和 v2rayN / 其他代理客户端共存
 
 Windows 上「系统代理」只有一个位置，v2rayN 会占着它并定期回写，所以**不要把 txtmux 设成系统代理**，

@@ -609,6 +609,60 @@ static RULE *find_rule_for_host(const WCHAR *host)
     return NULL;
 }
 
+/* 通过 upstream 里的 HTTP 代理建立到 host:port 的隧道（CONNECT） */
+static SOCKET dial_via_upstream(const WCHAR *host, int port)
+{
+    char upA[160], hostA[256], req[600], resp[600];
+    char *colon;
+    struct addrinfo hints, *res = NULL, *p;
+    SOCKET s = INVALID_SOCKET;
+    int used = 0;
+
+    if (!g_upstream[0]) return INVALID_SOCKET;
+
+    WideCharToMultiByte(CP_ACP, 0, g_upstream, -1, upA, sizeof(upA), NULL, NULL);
+    colon = strrchr(upA, ':');
+    if (!colon) return INVALID_SOCKET;
+    *colon = 0;
+
+    WideCharToMultiByte(CP_ACP, 0, host, -1, hostA, sizeof(hostA), NULL, NULL);
+
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(upA, colon + 1, &hints, &res) != 0) return INVALID_SOCKET;
+    for (p = res; p; p = p->ai_next) {
+        s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
+        if (connect(s, p->ai_addr, (int)p->ai_addrlen) == 0) break;
+        closesocket(s);
+        s = INVALID_SOCKET;
+    }
+    freeaddrinfo(res);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+    _snprintf(req, sizeof(req),
+              "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Connection: keep-alive\r\n\r\n",
+              hostA, port, hostA, port);
+    if (send(s, req, (int)strlen(req), 0) <= 0) { closesocket(s); return INVALID_SOCKET; }
+
+    /* 读到响应头结束 */
+    while (used < (int)sizeof(resp) - 1) {
+        int n = recv(s, resp + used, 1, 0);
+        if (n <= 0) break;
+        used++;
+        if (used >= 4 && !memcmp(resp + used - 4, "\r\n\r\n", 4)) break;
+    }
+    resp[used] = 0;
+    if (!strstr(resp, " 200")) {
+        log_line(L"[代理] 上游 %s 拒绝隧道 %s:%d（%s）", g_upstream, host, port, resp[0] ? L"非 200" : L"无响应");
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    log_line(L"[代理] %s:%d -> 上游 %s", host, port, g_upstream);
+    return s;
+}
+
 /* 把 host:port 连出去；命中规则就改连规则的当前端点 */
 static SOCKET dial_for(const WCHAR *host, int port, BOOL *usedRule)
 {
@@ -627,7 +681,12 @@ static SOCKET dial_for(const WCHAR *host, int port, BOOL *usedRule)
             log_line(L"[代理] %s:%d -> %s:%d", host, port, targetHost, targetPort);
         }
     }
-    if (!*usedRule) lstrcpynW(targetHost, host, 256);
+    if (!*usedRule) {
+        SOCKET viaProxy = dial_via_upstream(host, port);
+        if (viaProxy != INVALID_SOCKET) return viaProxy;
+        if (g_upstream[0]) return INVALID_SOCKET;   /* 配了上游就走上游，失败也不直连 */
+        lstrcpynW(targetHost, host, 256);
+    }
 
     WideCharToMultiByte(CP_ACP, 0, targetHost, -1, hostA, sizeof(hostA), NULL, NULL);
     _snprintf(portA, sizeof(portA), "%d", targetPort);

@@ -30,7 +30,17 @@ rule3=https://webdav.example.com/  8445  1  *.gw.example.com
 匹配优先级：匹配域名 → 入口域名 → 解析到的目标域名 → 未命中直连（按目标自身 A/AAAA）。
 一个端点对应一条规则；通配符用于同一服务的多个别名，不能把多个服务合并到一个端口。
 
-### 和 v2rayN 共存
+### 把 txtmux 当系统代理（链式到 v2rayN）
+
+v2rayN 的 `bin/config.json` 每次启动都会重新生成，手改无效。改为让 txtmux 占系统代理：
+
+- v2rayN 关掉「自动配置系统代理」
+- Windows 代理设为 `127.0.0.1:8080`
+- txtmux：`proxy=8080`、`upstream=127.0.0.1:10809`
+
+命中规则 → 直连真实端点；其余 → CONNECT 转给 v2rayN。配了 upstream 时上游失败不退回直连。
+
+### 和 v2rayN 共存（PAC 方式）
 
 Windows 的系统代理只有一个位置，v2rayN 会占着它，所以别把 txtmux 设成系统代理，用 PAC 分工：
 
