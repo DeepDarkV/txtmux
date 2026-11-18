@@ -14,6 +14,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windns.h>
+#include <winhttp.h>
 #include <commctrl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -44,7 +45,8 @@
 #define MAX_LOG_CHARS  16000
 
 typedef struct {
-    WCHAR record[256];
+    WCHAR record[256];   /* TXT 记录名，或 http(s):// 开头的入口 URL */
+    int kind;            /* 0 = TXT 记录，1 = 入口 URL（跟随 307） */
     int port;
     BOOL enabled;   /* 是否参与「启动全部」/ 自动启动 */
     /* 运行时 */
@@ -68,6 +70,7 @@ static size_t g_logLen, g_logCap;
 static RULE *g_rules[MAX_RULES];
 static int g_ruleCount;
 static BOOL g_autoStart;
+static WCHAR g_bindAddr[64] = L"127.0.0.1";   /* 监听地址，ini 里可改成 0.0.0.0 */
 
 /* ---------- 日志 ---------- */
 
@@ -111,6 +114,45 @@ static void get_text(HWND h, WCHAR *out, int cch)
 {
     out[0] = 0;
     if (h) GetWindowTextW(h, out, cch);
+}
+
+/* ---------- URL 解析 ---------- */
+
+/* 解析 http(s)://host[:port][/path]，返回 host/port，并给出路径起点。
+ * 返回 FALSE 表示不是合法 URL。 */
+static BOOL parse_url(const WCHAR *url, WCHAR *host, int hostCch, int *port, BOOL *secure, const WCHAR **path)
+{
+    const WCHAR *p = url;
+    const WCHAR *start;
+    int i = 0;
+    int defaultPort;
+
+    if (!wcsncmp(p, L"https://", 8)) { *secure = TRUE; defaultPort = 443; p += 8; }
+    else if (!wcsncmp(p, L"http://", 7)) { *secure = FALSE; defaultPort = 80; p += 7; }
+    else return FALSE;
+
+    start = p;
+    while (*p && *p != L'/' && *p != L':' && *p != L'?' && *p != L'#') {
+        if (i >= hostCch - 1) return FALSE;
+        host[i++] = *p++;
+    }
+    host[i] = 0;
+    if (!host[0]) return FALSE;
+
+    *port = defaultPort;
+    if (*p == L':') {
+        WCHAR num[16];
+        int j = 0;
+        p++;
+        while (*p >= L'0' && *p <= L'9' && j < 15) num[j++] = *p++;
+        num[j] = 0;
+        if (!j) return FALSE;
+        *port = _wtoi(num);
+        if (*port <= 0 || *port > 65535) return FALSE;
+    }
+    if (path) *path = (*p == L'/') ? p : L"/";
+    (void)start;
+    return TRUE;
 }
 
 /* ---------- DNS ---------- */
@@ -189,6 +231,66 @@ static BOOL parse_endpoint(const WCHAR *raw, WCHAR *hostOut, int hostCch, int *p
     return hostOut[0] && *portOut > 0 && *portOut <= 65535;
 }
 
+/* 用 WinHTTP 请求入口 URL（自动跟随 307/302），返回最终 URL */
+static BOOL fetch_final_url(const WCHAR *url, WCHAR *out, int outCch)
+{
+    WCHAR host[256];
+    const WCHAR *path = NULL;
+    int port = 0;
+    BOOL secure = FALSE;
+    HINTERNET session = NULL, conn = NULL, req = NULL;
+    BOOL ok = FALSE;
+
+    if (!parse_url(url, host, 256, &port, &secure, &path)) return FALSE;
+
+    session = WinHttpOpen(L"txtmux/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return FALSE;
+
+    conn = WinHttpConnect(session, host, (INTERNET_PORT)port, 0);
+    if (conn) {
+        req = WinHttpOpenRequest(conn, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 secure ? WINHTTP_FLAG_SECURE : 0);
+        if (req) {
+            DWORD sec = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            DWORD len = 0;
+
+            WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &sec, sizeof(sec));
+            if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(req, NULL)) {
+                WinHttpQueryOption(req, WINHTTP_OPTION_URL, NULL, &len);
+                if (len > 0 && len <= (DWORD)(outCch * sizeof(WCHAR))) {
+                    if (WinHttpQueryOption(req, WINHTTP_OPTION_URL, out, &len)) ok = TRUE;
+                }
+            }
+            WinHttpCloseHandle(req);
+        }
+        WinHttpCloseHandle(conn);
+    }
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+/* 入口 URL → 跳转后的 host:port */
+static BOOL resolve_redirect(const WCHAR *url, WCHAR *host, int hostCch, int *port)
+{
+    WCHAR finalUrl[2048], h[256];
+    const WCHAR *path = NULL;
+    BOOL secure = FALSE;
+    int p = 0;
+
+    if (!fetch_final_url(url, finalUrl, 2048)) return FALSE;
+    if (!parse_url(finalUrl, h, 256, &p, &secure, &path)) return FALSE;
+    lstrcpynW(host, h, hostCch);
+    *port = p;
+    if (p != 443 && p != 80)
+        log_line(L"跟随跳转: %s", finalUrl);
+    return TRUE;
+}
+
 /* 取该规则当前目标（带缓存与回退） */
 static BOOL rule_target(RULE *r, WCHAR *host, int *port, BOOL *changed)
 {
@@ -206,7 +308,8 @@ static BOOL rule_target(RULE *r, WCHAR *host, int *port, BOOL *changed)
     }
     LeaveCriticalSection(&g_lock);
 
-    if (resolve_txt(r->record, raw, 512) && parse_endpoint(raw, h, 256, &p)) {
+    if ((r->kind == 1) ? resolve_redirect(r->record, h, 256, &p)
+                       : (resolve_txt(r->record, raw, 512) && parse_endpoint(raw, h, 256, &p))) {
         EnterCriticalSection(&g_lock);
         if (!r->hasTarget || lstrcmpW(r->targetHost, h) != 0 || r->targetPort != p) *changed = TRUE;
         lstrcpynW(r->targetHost, h, 256);
@@ -343,11 +446,18 @@ static DWORD WINAPI accept_thread(LPVOID param)
 
     ZeroMemory(&addr, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (!lstrcmpW(g_bindAddr, L"0.0.0.0")) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        char bindA[64];
+        WideCharToMultiByte(CP_ACP, 0, g_bindAddr, -1, bindA, sizeof(bindA), NULL, NULL);
+        addr.sin_addr.s_addr = inet_addr(bindA);
+        if (addr.sin_addr.s_addr == INADDR_NONE) addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
     addr.sin_port = htons((u_short)r->port);
 
     if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(s, 16) != 0) {
-        log_line(L"[%s] 监听 127.0.0.1:%d 失败（端口被占用？）", r->record, r->port);
+        log_line(L"[%s] 监听 %s:%d 失败（端口被占用？）", r->record, g_bindAddr, r->port);
         closesocket(s);
         InterlockedExchange(&r->running, 0);
         PostMessage(g_hwnd, WM_APP_STATE, 0, 0);
@@ -356,7 +466,7 @@ static DWORD WINAPI accept_thread(LPVOID param)
 
     r->listenSock = s;
     InterlockedExchange(&r->running, 1);
-    log_line(L"[%s] 已监听 127.0.0.1:%d", r->record, r->port);
+    log_line(L"[%s] 已监听 %s:%d", r->record, g_bindAddr, r->port);
     PostMessage(g_hwnd, WM_APP_STATE, 0, 0);
 
     while (!r->stopFlag) {
@@ -506,6 +616,11 @@ static void config_load(void)
     int count, i;
 
     g_autoStart = GetPrivateProfileIntW(L"main", L"autostart", 1, g_iniPath) ? TRUE : FALSE;
+    {
+        WCHAR bindBuf[64];
+        GetPrivateProfileStringW(L"main", L"bind", L"127.0.0.1", bindBuf, 64, g_iniPath);
+        if (bindBuf[0]) lstrcpynW(g_bindAddr, bindBuf, 64);
+    }
     count = GetPrivateProfileIntW(L"main", L"count", 0, g_iniPath);
     if (count > MAX_RULES) count = MAX_RULES;
 
@@ -523,6 +638,7 @@ static void config_load(void)
             RULE *r = (RULE *)calloc(1, sizeof(RULE));
             if (!r) break;
             lstrcpynW(r->record, rec, 256);
+            r->kind = (!wcsncmp(rec, L"http://", 7) || !wcsncmp(rec, L"https://", 8)) ? 1 : 0;
             r->port = port;
             r->enabled = enabled;
             r->listenSock = INVALID_SOCKET;
@@ -589,6 +705,7 @@ static void on_add(void)
         RULE *r = (RULE *)calloc(1, sizeof(RULE));
         if (!r) { log_line(L"内存不足"); return; }
         lstrcpynW(r->record, record, 256);
+        r->kind = (!wcsncmp(record, L"http://", 7) || !wcsncmp(record, L"https://", 8)) ? 1 : 0;
         r->port = port;
         r->enabled = TRUE;
         r->listenSock = INVALID_SOCKET;

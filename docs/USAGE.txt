@@ -2,7 +2,16 @@ txtmux —— 多路 TXT 记录 → 本地端口 转发器（图形界面）
 ======================================================
 
 和 txtdial 的区别：txtdial 一次只管一条记录（命令行），txtmux 是带界面的管理器，
-可以同时配置并运行**多条**「TXT 记录 + 本地端口」的转发规则。
+可以同时配置并运行**多条**「TXT 记录 / 入口 URL + 本地端口」的转发规则。
+
+两种取值方式（在「TXT 记录」那个输入框里填什么都行）：
+
+1. **TXT 记录名**（如 `open.example.com`）—— 查 TXT 拿 `ip:端口`
+2. **入口 URL**（`http://` / `https://` 开头，如 `https://webdav.example.com/`）
+   —— 用 WinHTTP 请求它、自动跟随 307/302，取**跳转后**的 `host:端口`
+
+第 2 种就是「本地代理 web 服务的 STUN 端口、直接访问不跳转」：
+web 入口会 307 到一个随机 STUN 端口（每次变），txtmux 帮你把它变成一个固定的本地端口。
 
 文件
 ----
@@ -69,6 +78,7 @@ rule2=frps.example.com 7000 0
 
 已验证 / 未验证
 ---------------
+- 已验证：`parse_url` 的 7 个用例（https/http、带端口、带路径查询串、缺主机、端口 0、非 http 协议）
 - 已验证：`parse_rule_line` 的 7 个用例（两段旧格式、带禁用标记、带空白、缺端口、端口越界、空串）
   在 Linux 上单独跑过；`parse_endpoint` 的 8 个用例在 Linux 上单独跑过（IPv4、域名、`[v6]:port`、带空白、
   缺端口、裸 IPv6、空串、端口越界），并因此修掉一个真实 bug —— `[v6]:port` 解析时把 `]`
@@ -80,7 +90,7 @@ rule2=frps.example.com 7000 0
 ----
 ```sh
 # 需要 mingw-w64
-sh build.sh
+sh build.sh     # 已链接 -lwinhttp
 ```
 
 （源码与 ovpnwrap 的 C 版共用同一套写法：`DnsQuery_W` 查 TXT、`select` + 每连接一个线程做转发。）
