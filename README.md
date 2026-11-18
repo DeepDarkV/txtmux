@@ -16,6 +16,19 @@
 - **入口 URL**（`http://` / `https://` 开头）：WinHTTP 请求它、**自动跟随 307/302**，
   取跳转后的 `host:端口` —— 于是 web 服务的动态 STUN 端口也能变成固定本地端口
 
+### 和 v2rayN 共存
+
+Windows 的系统代理只有一个位置，v2rayN 会占着它，所以别把 txtmux 设成系统代理，用 PAC 分工：
+
+```ini
+[main]
+proxy=8080
+upstream=127.0.0.1:10809      ; v2rayN 的 HTTP 入站
+```
+
+浏览器代理填 `http://127.0.0.1:8080/proxy.pac`。txtmux 按当前规则生成 PAC：
+命中规则的域名走本代理，其余走 `upstream`（v2rayN），互不干扰。
+
 ### 让网页访问不跳转（本地代理模式）
 
 不要改 hosts —— `*.gw.example.com` 是双栈的，写 `127.0.0.1` 会把 AAAA 一起顶掉，

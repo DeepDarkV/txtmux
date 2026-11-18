@@ -70,6 +70,46 @@ hosts 只按名字覆盖解析：写一行 `127.0.0.1  webdav.gw.example.com` �
 AAAA 一起顶掉，走 IPv6 的访问就断了（本程序也只监听 IPv4，写 `::1` 也没用）。
 代理模式没有这个问题。
 
+### 和 v2rayN / 其他代理客户端共存
+
+Windows 上「系统代理」只有一个位置，v2rayN 会占着它并定期回写，所以**不要把 txtmux 设成系统代理**，
+用 PAC 分工：
+
+1. ini：
+
+   ```ini
+   [main]
+   proxy=8080
+   upstream=127.0.0.1:10809     ; v2rayN 的 HTTP 入站端口
+   ```
+
+2. 浏览器代理设置选「自动配置脚本 / PAC」，填：
+
+   ```
+   http://127.0.0.1:8080/proxy.pac
+   ```
+
+3. txtmux 生成的 PAC 长这样（按你的规则动态生成）：
+
+   ```js
+   function FindProxyForURL(url, host) {
+     if (host == "webdav.gw.example.com") return "PROXY 127.0.0.1:8080;";
+     if (host == "webdav.example.com") return "PROXY 127.0.0.1:8080;";
+     return "PROXY 127.0.0.1:10809; DIRECT";   // 其余照常走 v2rayN
+   }
+   ```
+
+于是：命中规则的域名由 txtmux 直连真实 STUN 端点，**其他所有站点照旧经过 v2rayN**，互不干扰。
+
+注意几点：
+
+- `upstream` 留空时兜底是 `DIRECT`（全部直连），那样其他站点就不走 v2ray 了，记得填上
+- 如果 v2rayN 用 **TUN/系统代理全接管** 模式，txtmux 自己的出站会被拦截：目标是国内地址时通常能通，
+  但会绕一圈。更稳妥的是在 v2ray 的路由规则里给 `203.0.113.10` 或
+  `domain:gw.example.com` 加 `direct`
+- txtmux 不做上游代理转发：它自己直连目标，`upstream` 只用在 PAC 兜底里
+- 浏览器以外、只会读系统代理的程序：要么临时切系统代理，要么用能设 PAC 的客户端
+
 ### 代理模式的限制
 
 - 只做 CONNECT 隧道 + SOCKS5 no-auth；不解析明文 HTTP 内容（不缓存、不改包）

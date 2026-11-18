@@ -73,6 +73,7 @@ static BOOL g_autoStart;
 static WCHAR g_bindAddr[64] = L"127.0.0.1";   /* 监听地址，ini 里可改成 0.0.0.0 */
 static int g_proxyPort = 0;                    /* >0 时额外起 HTTP/SOCKS5 代理 */
 static volatile LONG g_shutdown = 0;           /* 退出时通知代理线程 */
+static WCHAR g_upstream[128] = L"";            /* PAC 兜底代理，如 127.0.0.1:10809 */
 
 /* ---------- 日志 ---------- */
 
@@ -631,6 +632,62 @@ static SOCKET dial_for(const WCHAR *host, int port, BOOL *usedRule)
     return s;
 }
 
+/* 生成 PAC：命中规则的域名走本代理，其余交给 upstream（比如 v2ray 的 http 端口）*/
+static void send_pac(SOCKET client)
+{
+    char body[8192];
+    int used = 0;
+    int i;
+    char head[128];
+    char upstreamA[256] = "";
+
+    if (g_upstream[0]) {
+        WideCharToMultiByte(CP_ACP, 0, g_upstream, -1, upstreamA, sizeof(upstreamA), NULL, NULL);
+        _snprintf(head, sizeof(head), "PROXY %s; DIRECT", upstreamA);
+    } else {
+        _snprintf(head, sizeof(head), "DIRECT");
+    }
+
+    used += _snprintf(body + used, sizeof(body) - used,
+                      "function FindProxyForURL(url, host) {\r\n");
+
+    for (i = 0; i < g_ruleCount && used < (int)sizeof(body) - 400; i++) {
+        RULE *r = g_rules[i];
+        WCHAR h[256];
+        int p = 0;
+        BOOL secure = FALSE;
+        const WCHAR *path = NULL;
+        char hA[256];
+
+        if (r->kind == 1 && parse_url(r->record, h, 256, &p, &secure, &path)) {
+            WideCharToMultiByte(CP_ACP, 0, h, -1, hA, sizeof(hA), NULL, NULL);
+            used += _snprintf(body + used, sizeof(body) - used,
+                              "  if (host == \"%s\") return \"PROXY %s:%d;\";\r\n",
+                              hA, "127.0.0.1", g_proxyPort);
+        }
+        EnterCriticalSection(&g_lock);
+        if (r->hasTarget) {
+            WideCharToMultiByte(CP_ACP, 0, r->targetHost, -1, hA, sizeof(hA), NULL, NULL);
+            used += _snprintf(body + used, sizeof(body) - used,
+                              "  if (host == \"%s\") return \"PROXY %s:%d;\";\r\n",
+                              hA, "127.0.0.1", g_proxyPort);
+        }
+        LeaveCriticalSection(&g_lock);
+    }
+
+    used += _snprintf(body + used, sizeof(body) - used, "  return \"%s\";\r\n}\r\n", head);
+    if (used >= (int)sizeof(body)) used = (int)sizeof(body) - 1;
+
+    {
+        char resp[9000];
+        int n = _snprintf(resp, sizeof(resp),
+                          "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\n"
+                          "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+                          used, body);
+        if (n > 0) send(client, resp, n, 0);
+    }
+}
+
 static BOOL read_exact(SOCKET s, char *buf, int len)
 {
     int got = 0;
@@ -751,8 +808,25 @@ static void handle_proxy_client(SOCKET client)
         *sp2 = 0;
 
         if (_stricmp(line, "CONNECT") != 0) {
-            const char *msg = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-            send(client, msg, (int)strlen(msg), 0);
+            char method[16], target[512];
+            int mi = 0, ti = 0;
+            char *sp;
+
+            /* 拆出 METHOD 和 URL，用来识别 PAC 请求 */
+            sp = line;
+            while (*sp && *sp != ' ' && mi < 15) method[mi++] = *sp++;
+            method[mi] = 0;
+            while (*sp == ' ') sp++;
+            while (*sp && *sp != ' ' && ti < 511) target[ti++] = *sp++;
+            target[ti] = 0;
+
+            if (!_stricmp(method, "GET") &&
+                (strstr(target, "/proxy.pac") || !strcmp(target, "/"))) {
+                send_pac(client);
+            } else {
+                const char *msg = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+                send(client, msg, (int)strlen(msg), 0);
+            }
             closesocket(client);
             return;
         }
@@ -957,6 +1031,7 @@ static void config_load(void)
     }
     g_proxyPort = GetPrivateProfileIntW(L"main", L"proxy", 0, g_iniPath);
     if (g_proxyPort < 0 || g_proxyPort > 65535) g_proxyPort = 0;
+    GetPrivateProfileStringW(L"main", L"upstream", L"", g_upstream, 128, g_iniPath);
     count = GetPrivateProfileIntW(L"main", L"count", 0, g_iniPath);
     if (count > MAX_RULES) count = MAX_RULES;
 
