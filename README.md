@@ -114,4 +114,4 @@ msvcrt / USER32 / WS2_32），`-static` 静态链接，不需要 VC 运行库。
 - 该轮实机测试同时修掉了代理模式的四个 bug（CONNECT 恒 405、SOCKS5 拒绝 no-auth、
   自指请求缺 403 保护、退出时把规则末尾写成 `1 1`），详见 docs 的「更新记录」
 
-详细使用说明见 `docs/USAGE.txt`。
+详细使用说明见 `docs/USAGE.txt`，变更历史见 [CHANGELOG.md](CHANGELOG.md)。
