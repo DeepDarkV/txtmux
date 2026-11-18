@@ -66,6 +66,38 @@ public final class Logx {
         buf.setLength(0);
     }
 
+    /** 日志文件尾部若干行（界面打开时用来回填，避免"日志是空的"） */
+    public static synchronized String tail(int maxLines) {
+        if (active == null || !active.isFile()) return "";
+        try {
+            long len = active.length();
+            long from = Math.max(0, len - 32768);
+            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(active, "r");
+            String text;
+            try {
+                raf.seek(from);
+                byte[] buf = new byte[(int) (len - from)];
+                raf.readFully(buf);
+                text = new String(buf, StandardCharsets.UTF_8);
+            } finally {
+                try {
+                    raf.close();
+                } catch (Exception ignored) {
+                }
+            }
+            String[] lines = text.split("\r?\n");
+            int start = Math.max(0, lines.length - maxLines);
+            StringBuilder sb = new StringBuilder();
+            for (int i = start; i < lines.length; i++) {
+                if (lines[i].isEmpty()) continue;
+                sb.append(lines[i]).append('\n');
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     public static File activeFile() {
         return active;
     }

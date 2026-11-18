@@ -35,6 +35,8 @@ public class MainActivity extends Activity {
 
     private int sel = -1;
     private String listSig = "";
+    private String lastStatus = "";
+    private String lastHint = "";
     private boolean followLog = true;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -55,8 +57,14 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             try {
-                statusView.setText(eng.statusText());
+                eng.healthCheck();
+                String st = eng.statusText();
+                if (!st.equals(lastStatus)) {
+                    lastStatus = st;
+                    statusView.setText(st);
+                }
                 rebuildList();
+                updateProxyHint();
             } catch (Throwable ignored) {
             }
             ui.postDelayed(this, 1000);
@@ -72,9 +80,15 @@ public class MainActivity extends Activity {
         Logx.init(this, cfg.logMaxMB);
         setContentView(buildUi());
         Logx.addSink(sink);
-        logView.setText(Logx.text());
+        String hist = Logx.tail(200);
+        logView.setText(hist.isEmpty() ? Logx.text() : hist);
         loadEditors();
         askNotifyPermission();
+        Cfg c0 = eng.cfg();
+        Logx.line("界面已打开：%d 条规则，代理 %s，监听 %s",
+                eng.rules().size(),
+                c0.proxyPort > 0 ? String.valueOf(c0.proxyPort) : "未启用",
+                c0.bind);
         ui.post(refresh);
     }
 
@@ -319,13 +333,32 @@ public class MainActivity extends Activity {
     private void updateProxyHint() {
         Cfg c = eng.cfg();
         if (c == null) return;
+        String text;
+        int color = 0xff888888;
         if (c.proxyPort > 0) {
-            proxyHint.setText("PAC: http://" + c.bind + ":" + c.proxyPort + "/proxy.pac"
+            text = "PAC: http://" + c.bind + ":" + c.proxyPort + "/proxy.pac"
                     + "　代理: " + c.bind + ":" + c.proxyPort
-                    + "\n安卓系统代理需手动设置：设置 → WLAN → 当前网络 → 代理 → 手动。");
+                    + "\n安卓系统代理需手动设置：设置 → WLAN → 当前网络 → 代理 → 手动。";
         } else {
-            proxyHint.setText("代理端口为 0 时只做本地端口转发。");
+            boolean hasMatch = false;
+            for (Rule r : eng.rules()) {
+                if (r.match != null && !r.match.isEmpty()) {
+                    hasMatch = true;
+                    break;
+                }
+            }
+            if (hasMatch) {
+                color = 0xffb05000;
+                text = "注意：有规则填了「匹配域名」，但代理端口为 0，"
+                        + "代理分流不会生效（这些规则现在只做本地端口转发）。要用通配域名分流，先填代理端口并保存。";
+            } else {
+                text = "代理端口为 0 时只做本地端口转发。";
+            }
         }
+        if (lastHint.equals(text)) return;
+        lastHint = text;
+        proxyHint.setTextColor(color);
+        proxyHint.setText(text);
     }
 
     /* ---------------- 交互 ---------------- */
@@ -509,7 +542,8 @@ public class MainActivity extends Activity {
             Rule r = rs.get(i);
             sig.append(i).append('|').append(r.src).append('|').append(r.match).append('|')
                     .append(r.port).append('|').append(r.enabled).append('|').append(r.running)
-                    .append('|').append(r.hasTarget ? r.targetHost + ":" + r.targetPort : "-")
+                    .append('|').append(r.resolving).append('|')
+                    .append(r.hasTarget ? r.targetHost + ":" + r.targetPort : "-")
                     .append('|').append(r.lastError).append('\n');
         }
         String s = sig.toString();
@@ -539,7 +573,14 @@ public class MainActivity extends Activity {
 
             TextView l2 = new TextView(this);
             l2.setTextSize(12);
-            l2.setTextColor(r.running ? 0xff2e7d32 : (r.enabled ? 0xff777777 : 0xffb05000));
+            boolean err2 = r.lastError != null && !r.lastError.isEmpty();
+            int color;
+            if (r.running && r.hasTarget && !err2) color = 0xff2e7d32;
+            else if (r.running && err2) color = 0xffb05000;
+            else if (r.running) color = 0xff1565c0;
+            else if (!r.enabled) color = 0xffb05000;
+            else color = 0xff777777;
+            l2.setTextColor(color);
             l2.setText(r.stateText());
 
             item.addView(l1);

@@ -30,6 +30,7 @@ public class Engine {
     public static final int MAX_RULES = 32;
 
     private static final int TTL_MS = 30000;
+    private static final int FAIL_RETRY_MS = 5000;
     private static final int CONNECT_TIMEOUT = 8000;
 
     private static volatile Engine inst;
@@ -150,6 +151,8 @@ public class Engine {
                 rs.add(r);
             }
             save();
+            Logx.line("规则%s：%s :%d%s", index >= 0 ? "已修改" : "已新增", s, port,
+                    m.isEmpty() ? "" : "（匹配 " + m + "）");
         }
         return null;
     }
@@ -160,6 +163,7 @@ public class Engine {
             Rule r = cfg.rules.remove(index);
             stopRule(r);
             save();
+            Logx.line("已删除规则：%s :%d", r.src, r.port);
         }
     }
 
@@ -170,6 +174,7 @@ public class Engine {
             r.enabled = enabled;
             if (!enabled) stopRule(r);
             save();
+            Logx.line("规则 %s 已%s", r.name(), enabled ? "启用" : "停用");
         }
     }
 
@@ -185,6 +190,9 @@ public class Engine {
         c.upstreamBlock = block;
         c.autostart = autostart;
         save();
+        Logx.line("代理设置已保存：%s:%d%s%s", c.bind, c.proxyPort,
+                c.upstream.isEmpty() ? "" : "，上游 " + c.upstream,
+                c.autostart ? "，开机自启" : "");
         if (was && c.proxyPort > 0) startProxy();
     }
 
@@ -204,6 +212,40 @@ public class Engine {
         stopProxy();
     }
 
+    /** 把 running 与实际套接字/线程对齐，避免界面显示"运行中"实际已断 */
+    public void healthCheck() {
+        for (Rule r : rules()) {
+            Thread t = r.thread;
+            if (t == null) {
+                if (r.running) {
+                    r.running = false;
+                    Logx.line("[%s] 状态修正：已停止", r.name());
+                }
+                continue;
+            }
+            ServerSocket ss = r.ss;
+            boolean alive = t.isAlive();
+            boolean bound = ss != null && !ss.isClosed();
+            if (!alive || !bound) {
+                r.running = false;
+                r.thread = null;
+                if (ss != null) {
+                    try {
+                        ss.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+                r.ss = null;
+                r.lastError = "监听已中断";
+                Logx.line("[%s] 监听已中断，状态修正为已停止", r.name());
+            }
+        }
+        if (proxyThread == null && proxyRunning) {
+            proxyRunning = false;
+            Logx.line("代理状态修正：已停止");
+        }
+    }
+
     public boolean isAnythingRunning() {
         for (Rule r : rules()) if (r.running) return true;
         return proxyRunning;
@@ -221,6 +263,18 @@ public class Engine {
         }, "txtmux-rule-" + r.port);
         r.thread = t;
         t.start();
+        /* 启动就解析一次：列表上直接显示真实目标或失败原因，不用等第一个连接 */
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                Target tg = targetFor(r);
+                if (tg == null) {
+                    Logx.line("[%s] 暂时没有可用目标：%s", r.name(), r.lastError);
+                } else {
+                    Logx.line("[%s] 目标 %s:%d", r.name(), tg.host, tg.port);
+                }
+            }
+        }, "txtmux-pre-" + r.port).start();
     }
 
     public void stopRule(Rule r) {
@@ -337,17 +391,31 @@ public class Engine {
             if (r.hasTarget && now - r.targetAt < TTL_MS) {
                 return new Target(r.targetHost, r.targetPort);
             }
-            Target t = resolveRule(r);
+            /* 刚失败过就先不重试，免得每个连接都等满超时 */
+            if (!r.hasTarget && r.lastTryAt != 0 && now - r.lastTryAt < FAIL_RETRY_MS) {
+                return null;
+            }
+            r.resolving = true;
+            Target t;
+            try {
+                t = resolveRule(r);
+            } finally {
+                r.resolving = false;
+            }
+            r.lastTryAt = now;
             if (t != null) {
                 boolean changed = !r.hasTarget || !t.host.equalsIgnoreCase(r.targetHost) || t.port != r.targetPort;
                 r.targetHost = t.host;
                 r.targetPort = t.port;
                 r.targetAt = now;
                 r.hasTarget = true;
+                r.lastError = "";
                 if (changed) Logx.line("%s -> %s:%d", r.src, t.host, t.port);
                 return t;
             }
+            if (r.lastError == null || r.lastError.isEmpty()) r.lastError = "没有解析出可用地址";
             if (r.hasTarget) {
+                r.lastError = "解析失败，暂时沿用 " + r.targetHost + ":" + r.targetPort;
                 Logx.line("WARN 解析 %s 失败，沿用 %s:%d", r.src, r.targetHost, r.targetPort);
                 return new Target(r.targetHost, r.targetPort);
             }
@@ -361,23 +429,27 @@ public class Engine {
                 String finalUrl = HttpFollow.finalUrl(r.src);
                 Net.Url u = Net.parseUrl(finalUrl);
                 if (u == null) {
+                    r.lastError = "跳转后的 URL 不合法";
                     Logx.line("WARN 跟随跳转后的 URL 不合法: %s", finalUrl);
                     return null;
                 }
                 if (u.port != 443 && u.port != 80) Logx.line("跟随跳转: %s", finalUrl);
                 return new Target(u.host, u.port);
             } catch (Exception e) {
+                r.lastError = "跟随跳转失败：" + e.getMessage();
                 Logx.line("WARN 跟随跳转失败: %s（%s）", r.src, e.getMessage());
                 return null;
             }
         }
         String value = Dns.txt(app, r.src);
         if (value == null || value.isEmpty()) {
+            r.lastError = "TXT 查询失败";
             Logx.line("WARN TXT %s 查询失败", r.src);
             return null;
         }
         Net.Endpoint ep = Net.parseEndpoint(value);
         if (ep == null) {
+            r.lastError = "TXT 不是 host:port（" + value + "）";
             Logx.line("WARN TXT %s 不是 host:port（%s）", r.src, value);
             return null;
         }

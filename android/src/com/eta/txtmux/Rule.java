@@ -21,6 +21,8 @@ public class Rule {
     volatile int targetPort;
     volatile long targetAt;
     volatile boolean hasTarget;
+    volatile boolean resolving;
+    volatile long lastTryAt;
     volatile String lastError = "";
 
     public boolean isUrl() {
@@ -37,11 +39,14 @@ public class Rule {
     }
 
     public String stateText() {
+        boolean err = lastError != null && !lastError.isEmpty();
         if (running) {
-            if (hasTarget) return "运行中 → " + targetHost + ":" + targetPort;
-            return "运行中（尚未解析到目标）";
+            if (resolving) return "监听中 · 正在解析目标…";
+            if (hasTarget) return "监听中 → " + targetHost + ":" + targetPort + (err ? "（最近一次解析失败）" : "");
+            if (err) return "监听中 · 目标解析失败：" + lastError;
+            return "监听中（还没有解析过目标，第一次连接时解析）";
         }
-        if (!lastError.isEmpty()) return "失败：" + lastError;
+        if (err) return "已停止 · 上次失败：" + lastError;
         if (!enabled) return "已禁用";
         return "已停止";
     }
