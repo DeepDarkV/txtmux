@@ -16,17 +16,20 @@
 - **入口 URL**（`http://` / `https://` 开头）：WinHTTP 请求它、**自动跟随 307/302**，
   取跳转后的 `host:端口` —— 于是 web 服务的动态 STUN 端口也能变成固定本地端口
 
-### 让网页访问不跳转
+### 让网页访问不跳转（本地代理模式）
 
-`https://webdav.example.com/` 会 307 跳到 `https://webdav.gw.example.com:<随机端口>/`。
-用 txtmux 把它变成固定入口：
+不要改 hosts —— `*.gw.example.com` 是双栈的，写 `127.0.0.1` 会把 AAAA 一起顶掉，
+IPv6 访问就断了。用本地代理：
 
-1. 规则填 `https://webdav.example.com/`，本地端口 `8443`
-2. hosts 加一行：`127.0.0.1  webdav.gw.example.com`
-3. 浏览器访问 `https://webdav.gw.example.com:8443/`
+```ini
+[main]
+proxy=8080
+```
 
-TLS 端到端直通（txtmux 不解密），所以域名必须用证书覆盖的 `*.gw.example.com` 形式。
-局域网共享：ini 里 `[main] bind=0.0.0.0`。
+浏览器代理指向 `127.0.0.1:8080`，规则填 `https://webdav.example.com/`，然后直接访问
+`https://webdav.gw.example.com/`。txtmux 收到 `CONNECT` 后认出域名、跟随 307 拿到
+真实 STUN 端点、直连并回 200，TLS 端到端直通（证书 `*.gw.example.com` 匹配）。
+不动 DNS，不解析明文 HTTP，非匹配域名直接直连。
 
 ## 功能
 

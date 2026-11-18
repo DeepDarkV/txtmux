@@ -71,6 +71,8 @@ static RULE *g_rules[MAX_RULES];
 static int g_ruleCount;
 static BOOL g_autoStart;
 static WCHAR g_bindAddr[64] = L"127.0.0.1";   /* 监听地址，ini 里可改成 0.0.0.0 */
+static int g_proxyPort = 0;                    /* >0 时额外起 HTTP/SOCKS5 代理 */
+static volatile LONG g_shutdown = 0;           /* 退出时通知代理线程 */
 
 /* ---------- 日志 ---------- */
 
@@ -363,6 +365,22 @@ static DWORD WINAPI copy_thread(LPVOID param)
     return 0;
 }
 
+/* 在两个已连通的 socket 之间做双向转发，直到两边都结束 */
+static void bridge(SOCKET a, SOCKET b)
+{
+    COPY_CTX up, down;
+    HANDLE th1, th2;
+
+    up.from = a;   up.to = b;
+    down.from = b; down.to = a;
+    th1 = CreateThread(NULL, 0, copy_thread, &up, 0, NULL);
+    th2 = CreateThread(NULL, 0, copy_thread, &down, 0, NULL);
+    if (th1) { WaitForSingleObject(th1, INFINITE); CloseHandle(th1); }
+    if (th2) { WaitForSingleObject(th2, INFINITE); CloseHandle(th2); }
+    closesocket(a);
+    closesocket(b);
+}
+
 typedef struct {
     RULE *rule;
     SOCKET client;
@@ -379,8 +397,6 @@ static DWORD WINAPI client_thread(LPVOID param)
     char hostA[256], portA[16];
     struct addrinfo hints, *res = NULL, *p;
     SOCKET upstream = INVALID_SOCKET;
-    COPY_CTX up, down;
-    HANDLE th1, th2;
 
     free(ctx);
 
@@ -417,15 +433,7 @@ static DWORD WINAPI client_thread(LPVOID param)
         return 0;
     }
 
-    up.from = client;   up.to = upstream;
-    down.from = upstream; down.to = client;
-    th1 = CreateThread(NULL, 0, copy_thread, &up, 0, NULL);
-    th2 = CreateThread(NULL, 0, copy_thread, &down, 0, NULL);
-    if (th1) { WaitForSingleObject(th1, INFINITE); CloseHandle(th1); }
-    if (th2) { WaitForSingleObject(th2, INFINITE); CloseHandle(th2); }
-
-    closesocket(client);
-    closesocket(upstream);
+    bridge(client, upstream);
     return 0;
 }
 
@@ -534,6 +542,332 @@ static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int
     return TRUE;
 }
 
+/* ---------- 本地代理（HTTP CONNECT + SOCKS5）---------- */
+
+/* 在规则里找与 host 匹配的一条：
+ * 1) 规则的入口域名就是它（URL 模式），或
+ * 2) 规则最近一次解析到的目标域名就是它。 */
+static RULE *find_rule_for_host(const WCHAR *host)
+{
+    int i;
+    BOOL changed;
+
+    /* 第一遍：入口域名或已缓存的目标域名匹配 */
+    for (i = 0; i < g_ruleCount; i++) {
+        RULE *r = g_rules[i];
+        WCHAR h[256];
+        int p = 0;
+        BOOL secure = FALSE;
+        const WCHAR *path = NULL;
+
+        if (r->kind == 1 && parse_url(r->record, h, 256, &p, &secure, &path)) {
+            if (lstrcmpiW(h, host) == 0) return r;
+        }
+        EnterCriticalSection(&g_lock);
+        if (r->hasTarget && lstrcmpiW(r->targetHost, host) == 0) {
+            LeaveCriticalSection(&g_lock);
+            return r;
+        }
+        LeaveCriticalSection(&g_lock);
+    }
+
+    /* 第二遍：让 URL 规则先解析一次，再拿解析出来的目标域名比对
+     * （例如规则是 https://webdav.example.com/，浏览器访问的是 307 之后的
+     *   webdav.gw.example.com，只有解析过才知道是同一个服务） */
+    for (i = 0; i < g_ruleCount; i++) {
+        RULE *r = g_rules[i];
+        WCHAR th[256];
+        int tp = 0;
+
+        if (r->kind != 1) continue;
+        changed = FALSE;
+        if (!rule_target(r, th, &tp, &changed)) continue;
+        EnterCriticalSection(&g_lock);
+        if (r->hasTarget && lstrcmpiW(r->targetHost, host) == 0) {
+            LeaveCriticalSection(&g_lock);
+            return r;
+        }
+        LeaveCriticalSection(&g_lock);
+    }
+    return NULL;
+}
+
+/* 把 host:port 连出去；命中规则就改连规则的当前端点 */
+static SOCKET dial_for(const WCHAR *host, int port, BOOL *usedRule)
+{
+    WCHAR targetHost[256];
+    int targetPort = port;
+    RULE *r = find_rule_for_host(host);
+    char hostA[256], portA[16];
+    struct addrinfo hints, *res = NULL, *p;
+    SOCKET s = INVALID_SOCKET;
+
+    *usedRule = FALSE;
+    if (r) {
+        BOOL changed = FALSE;
+        if (rule_target(r, targetHost, &targetPort, &changed)) {
+            *usedRule = TRUE;
+            log_line(L"[代理] %s:%d -> %s:%d", host, port, targetHost, targetPort);
+        }
+    }
+    if (!*usedRule) lstrcpynW(targetHost, host, 256);
+
+    WideCharToMultiByte(CP_ACP, 0, targetHost, -1, hostA, sizeof(hostA), NULL, NULL);
+    _snprintf(portA, sizeof(portA), "%d", targetPort);
+
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(hostA, portA, &hints, &res) != 0) return INVALID_SOCKET;
+
+    for (p = res; p; p = p->ai_next) {
+        s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
+        if (connect(s, p->ai_addr, (int)p->ai_addrlen) == 0) break;
+        closesocket(s);
+        s = INVALID_SOCKET;
+    }
+    freeaddrinfo(res);
+    return s;
+}
+
+static BOOL read_exact(SOCKET s, char *buf, int len)
+{
+    int got = 0;
+    while (got < len) {
+        int n = recv(s, buf + got, len - got, 0);
+        if (n <= 0) return FALSE;
+        got += n;
+    }
+    return TRUE;
+}
+
+/* 处理一个代理连接：先看头一个字节区分 SOCKS5(0x05) 与 HTTP */
+static void handle_proxy_client(SOCKET client)
+{
+    unsigned char first = 0;
+    WCHAR whost[256], wport[16];
+    int port = 0;
+    SOCKET upstream;
+    BOOL usedRule = FALSE;
+
+    if (recv(client, (char *)&first, 1, 0) != 1) { closesocket(client); return; }
+
+    if (first == 0x05) {
+        /* ---- SOCKS5 ---- */
+        unsigned char buf[512];
+        int nmethods, i;
+        unsigned char method = 0;
+
+        if (!read_exact(client, (char *)buf, 1)) { closesocket(client); return; }
+        nmethods = buf[0];
+        for (i = 0; i < nmethods; i++) {
+            if (!read_exact(client, (char *)buf, 1)) { closesocket(client); return; }
+            if (buf[0] == 0x00) method = 0x00;   /* 只支持 no-auth */
+            else if (!method) method = 0xFF;
+        }
+        {
+            char resp[2];
+            resp[0] = 0x05;
+            resp[1] = (char)(method ? method : 0xFF);
+            send(client, resp, 2, 0);
+        }
+        if (!method) { closesocket(client); return; }
+
+        if (!read_exact(client, (char *)buf, 4)) { closesocket(client); return; }
+        if (buf[0] != 0x05 || buf[1] != 0x01) { closesocket(client); return; } /* 只支持 CONNECT */
+
+        if (buf[3] == 0x01) {             /* IPv4 */
+            char ip[4];
+            char ipText[32];
+            if (!read_exact(client, ip, 4)) { closesocket(client); return; }
+            _snprintf(ipText, sizeof(ipText), "%u.%u.%u.%u",
+                      (unsigned char)ip[0], (unsigned char)ip[1],
+                      (unsigned char)ip[2], (unsigned char)ip[3]);
+            MultiByteToWideChar(CP_ACP, 0, ipText, -1, whost, 256);
+        } else if (buf[3] == 0x03) {      /* 域名 */
+            unsigned char len = 0;
+            char nameA[256];
+            if (!read_exact(client, (char *)&len, 1)) { closesocket(client); return; }
+            if (len == 0 || !read_exact(client, nameA, len)) { closesocket(client); return; }
+            nameA[len] = 0;
+            MultiByteToWideChar(CP_ACP, 0, nameA, -1, whost, 256);
+        } else {
+            closesocket(client);          /* IPv6 目标暂不支持 */
+            return;
+        }
+        {
+            unsigned char pb[2];
+            if (!read_exact(client, (char *)pb, 2)) { closesocket(client); return; }
+            port = ((int)pb[0] << 8) | pb[1];
+        }
+
+        upstream = dial_for(whost, port, &usedRule);
+        if (upstream == INVALID_SOCKET) {
+            char fail[10] = { 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+            send(client, fail, 10, 0);
+            closesocket(client);
+            return;
+        }
+        {
+            unsigned char ok[10] = { 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+            send(client, (char *)ok, 10, 0);
+        }
+        bridge(client, upstream);
+        return;
+    }
+
+    /* ---- HTTP 代理：CONNECT host:port HTTP/1.1 ---- */
+    {
+        char req[2048];
+        int used = 0;
+        char line[512];
+        char *sp1, *sp2;
+
+        req[used++] = (char)first;
+        while (used < (int)sizeof(req) - 1) {
+            int n = recv(client, req + used, 1, 0);
+            if (n <= 0) break;
+            used++;
+            if (used >= 4 && !memcmp(req + used - 4, "\r\n\r\n", 4)) break;
+            if (used >= 2 && req[used - 1] == '\n' && req[used - 2] == '\n') break;
+        }
+        req[used] = 0;
+
+        /* 只处理首行 */
+        {
+            int i = 0;
+            while (i < used && req[i] != '\r' && req[i] != '\n' && i < (int)sizeof(line) - 1) {
+                line[i] = req[i];
+                i++;
+            }
+            line[i] = 0;
+        }
+
+        sp1 = strchr(line, ' ');
+        if (!sp1) { closesocket(client); return; }
+        sp2 = strchr(sp1 + 1, ' ');
+        if (!sp2) { closesocket(client); return; }
+        *sp2 = 0;
+
+        if (_stricmp(line, "CONNECT") != 0) {
+            const char *msg = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+            send(client, msg, (int)strlen(msg), 0);
+            closesocket(client);
+            return;
+        }
+
+        {
+            char *target = sp1 + 1;
+            char *colon = strrchr(target, ':');
+            char hostA[256];
+            if (!colon) { closesocket(client); return; }
+            *colon = 0;
+            port = atoi(colon + 1);
+            lstrcpynA(hostA, target, sizeof(hostA));
+            MultiByteToWideChar(CP_ACP, 0, hostA, -1, whost, 256);
+        }
+        if (!whost[0] || port <= 0) { closesocket(client); return; }
+
+        upstream = dial_for(whost, port, &usedRule);
+        if (upstream == INVALID_SOCKET) {
+            const char *msg = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+            send(client, msg, (int)strlen(msg), 0);
+            closesocket(client);
+            return;
+        }
+        {
+            const char *ok = "HTTP/1.1 200 Connection established\r\n\r\n";
+            send(client, ok, (int)strlen(ok), 0);
+        }
+        bridge(client, upstream);
+        (void)wport;
+    }
+}
+
+typedef struct {
+    SOCKET listenSock;
+    int port;
+} PROXY_CTX;
+
+static DWORD WINAPI proxy_client_thread(LPVOID param)
+{
+    handle_proxy_client((SOCKET)(UINT_PTR)param);
+    return 0;
+}
+
+static DWORD WINAPI proxy_accept_thread(LPVOID param)
+{
+    PROXY_CTX *ctx = (PROXY_CTX *)param;
+    SOCKET s = ctx->listenSock;
+
+    log_line(L"代理已就绪: %s:%d（HTTP CONNECT / SOCKS5）", g_bindAddr, ctx->port);
+    free(ctx);
+
+    while (!g_shutdown) {
+        fd_set set;
+        struct timeval tv;
+        SOCKET client;
+
+        FD_ZERO(&set);
+        FD_SET(s, &set);
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000;
+        if (select(0, &set, NULL, NULL, &tv) <= 0) continue;
+
+        client = accept(s, NULL, NULL);
+        if (client == INVALID_SOCKET) continue;
+        {
+            HANDLE th = CreateThread(NULL, 0, proxy_client_thread,
+                                     (LPVOID)(UINT_PTR)client, 0, NULL);
+            if (th) CloseHandle(th); else closesocket(client);
+        }
+    }
+    closesocket(s);
+    return 0;
+}
+
+static void proxy_start(void)
+{
+    struct sockaddr_in addr;
+    SOCKET s;
+    BOOL reuse = TRUE;
+    PROXY_CTX *ctx;
+
+    if (g_proxyPort <= 0) return;
+
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) { log_line(L"代理: 创建 socket 失败"); return; }
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+
+    ZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    if (!lstrcmpW(g_bindAddr, L"0.0.0.0")) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        char bindA[64];
+        WideCharToMultiByte(CP_ACP, 0, g_bindAddr, -1, bindA, sizeof(bindA), NULL, NULL);
+        addr.sin_addr.s_addr = inet_addr(bindA);
+        if (addr.sin_addr.s_addr == INADDR_NONE) addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
+    addr.sin_port = htons((u_short)g_proxyPort);
+
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(s, 16) != 0) {
+        log_line(L"代理: 监听 %s:%d 失败（端口被占用？）", g_bindAddr, g_proxyPort);
+        closesocket(s);
+        return;
+    }
+
+    ctx = (PROXY_CTX *)calloc(1, sizeof(PROXY_CTX));
+    if (!ctx) { closesocket(s); return; }
+    ctx->listenSock = s;
+    ctx->port = g_proxyPort;
+    {
+        HANDLE th = CreateThread(NULL, 0, proxy_accept_thread, ctx, 0, NULL);
+        if (th) CloseHandle(th); else { closesocket(s); free(ctx); }
+    }
+}
+
 /* ---------- 规则管理 ---------- */
 
 static void rule_start(RULE *r)
@@ -621,6 +955,8 @@ static void config_load(void)
         GetPrivateProfileStringW(L"main", L"bind", L"127.0.0.1", bindBuf, 64, g_iniPath);
         if (bindBuf[0]) lstrcpynW(g_bindAddr, bindBuf, 64);
     }
+    g_proxyPort = GetPrivateProfileIntW(L"main", L"proxy", 0, g_iniPath);
+    if (g_proxyPort < 0 || g_proxyPort > 65535) g_proxyPort = 0;
     count = GetPrivateProfileIntW(L"main", L"count", 0, g_iniPath);
     if (count > MAX_RULES) count = MAX_RULES;
 
@@ -867,6 +1203,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_CLOSE:
         on_stop_all();
+        InterlockedExchange(&g_shutdown, 1);
         config_save();
         DestroyWindow(hwnd);
         return 0;
@@ -938,6 +1275,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
 
+    if (g_proxyPort > 0) proxy_start();
     if (g_autoStart && g_ruleCount > 0) on_start_all();
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
