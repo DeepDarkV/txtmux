@@ -70,6 +70,37 @@ hosts 只按名字覆盖解析：写一行 `127.0.0.1  webdav.gw.example.com` �
 AAAA 一起顶掉，走 IPv6 的访问就断了（本程序也只监听 IPv4，写 `::1` 也没用）。
 代理模式没有这个问题。
 
+### 泛域名（*.gw.example.com）怎么配
+
+每条规则多了一个可选的**「匹配域名」**（支持 `*` 通配），这样"客户端访问的名字"和
+"端口从哪来"就可以分开指定。
+
+匹配优先级：① 匹配域名字段 → ② 入口 URL 的域名 → ③ 解析出来的目标域名 → ④ 都没命中就直连。
+
+界面第 2 行填「匹配域名」，或者在 ini 里写第 4 段：
+
+```ini
+[rules]
+; webdav：入口会 307，跟随它；客户端访问 webdav.gw.example.com
+rule1=https://webdav.example.com/   8443  1  webdav.gw.example.com
+; 另一个 web 服务（有自己的入口）
+rule2=https://git.example.com/      8444  1  git.gw.example.com
+; 端口只存在 TXT 里的 TCP 服务
+rule3=open.example.com              9000  1  open.gw.example.com
+; 一条通配规则：任意一层子域都指向同一个端点（同一服务多个别名时用）
+rule4=https://webdav.example.com/   8445  1  *.gw.example.com
+```
+
+要点：
+
+- **一个端点一条规则**：泛域下不同子域对应不同服务，必须各写一条；通配符解决的是
+  "同一服务的多个名字"，不是"多个服务共用一个端口"
+- 通配语法：`*` 匹配任意字符（含点）。`*.gw.example.com` 覆盖
+  `webdav.gw.example.com`、`a.b.gw.example.com`，但**不含**裸域
+  `gw.example.com`；要连裸域就再加一条 `gw.example.com`
+- v2ray 那边的路由可以写宽（`domain:gw.example.com`）：命中的走 txtmux，
+  没命中的 txtmux 会**直接直连**（出站按目标自身的 A/AAAA 选择，IPv6 不会被降级）
+
 ### 和 v2rayN / 其他代理客户端共存
 
 Windows 上「系统代理」只有一个位置，v2rayN 会占着它并定期回写，所以**不要把 txtmux 设成系统代理**，

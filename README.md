@@ -16,6 +16,20 @@
 - **入口 URL**（`http://` / `https://` 开头）：WinHTTP 请求它、**自动跟随 307/302**，
   取跳转后的 `host:端口` —— 于是 web 服务的动态 STUN 端口也能变成固定本地端口
 
+### 泛域名配置
+
+每条规则可带一个**匹配域名**（支持 `*`），把"客户端访问的名字"和"端口来源"分开：
+
+```ini
+[rules]
+rule1=https://webdav.example.com/  8443  1  webdav.gw.example.com
+rule2=open.example.com             9000  1  open.gw.example.com
+rule3=https://webdav.example.com/  8445  1  *.gw.example.com
+```
+
+匹配优先级：匹配域名 → 入口域名 → 解析到的目标域名 → 未命中直连（按目标自身 A/AAAA）。
+一个端点对应一条规则；通配符用于同一服务的多个别名，不能把多个服务合并到一个端口。
+
 ### 和 v2rayN 共存
 
 Windows 的系统代理只有一个位置，v2rayN 会占着它，所以别把 txtmux 设成系统代理，用 PAC 分工：

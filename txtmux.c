@@ -31,6 +31,7 @@
 #define IDC_ED_PORT   2002
 #define IDC_LB_RULES  2003
 #define IDC_ED_LOG    2004
+#define IDC_ED_MATCH  2007
 #define IDC_LB_STATUS 2005
 #define IDC_CK_AUTO   2006
 #define IDC_BT_ADD    1001
@@ -46,6 +47,7 @@
 
 typedef struct {
     WCHAR record[256];   /* TXT 记录名，或 http(s):// 开头的入口 URL */
+    WCHAR match[256];    /* 可选：客户端访问的域名（支持 * 通配），空则用 record/解析结果 */
     int kind;            /* 0 = TXT 记录，1 = 入口 URL（跟随 307） */
     int port;
     BOOL enabled;   /* 是否参与「启动全部」/ 自动启动 */
@@ -62,7 +64,7 @@ typedef struct {
 } RULE;
 
 static HINSTANCE g_inst;
-static HWND g_hwnd, g_edRecord, g_edPort, g_lbRules, g_edLog, g_lbStatus, g_ckAuto;
+static HWND g_hwnd, g_edRecord, g_edPort, g_lbRules, g_edLog, g_lbStatus, g_ckAuto, g_edMatch;
 static WCHAR g_iniPath[MAX_PATH];
 static CRITICAL_SECTION g_lock;
 static WCHAR *g_logBuf;
@@ -73,6 +75,8 @@ static BOOL g_autoStart;
 static WCHAR g_bindAddr[64] = L"127.0.0.1";   /* 监听地址，ini 里可改成 0.0.0.0 */
 static int g_proxyPort = 0;                    /* >0 时额外起 HTTP/SOCKS5 代理 */
 static volatile LONG g_shutdown = 0;           /* 退出时通知代理线程 */
+
+static BOOL host_match(const WCHAR *pattern, const WCHAR *host);
 static WCHAR g_upstream[128] = L"";            /* PAC 兜底代理，如 127.0.0.1:10809 */
 
 /* ---------- 日志 ---------- */
@@ -510,7 +514,8 @@ static DWORD WINAPI accept_thread(LPVOID param)
 }
 
 /* 解析 ini 里的一行规则："record port [enabled]"。enabled 省略时视为 1。 */
-static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int *port, BOOL *enabled)
+static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int *port, BOOL *enabled,
+                            WCHAR *match, int matchCch)
 {
     const WCHAR *p = line;
     const WCHAR *tok;
@@ -540,6 +545,16 @@ static BOOL parse_rule_line(const WCHAR *line, WCHAR *record, int recordCch, int
     while (*p == L' ' || *p == L'\t') p++;
     if (*p == L'0') *enabled = FALSE;
     else *enabled = TRUE;
+
+    /* 可选的第四段：匹配域名 */
+    if (match && matchCch > 0) {
+        const WCHAR *m = p;
+        int k = 0;
+        match[0] = 0;
+        while (*m == L' ' || *m == L'\t') m++;
+        while (*m && *m != L' ' && *m != L'\t' && k < matchCch - 1) match[k++] = *m++;
+        match[k] = 0;
+    }
     return TRUE;
 }
 
@@ -553,7 +568,7 @@ static RULE *find_rule_for_host(const WCHAR *host)
     int i;
     BOOL changed;
 
-    /* 第一遍：入口域名或已缓存的目标域名匹配 */
+    /* 第一遍：显式 match 字段 → 入口域名 → 已缓存的目标域名 */
     for (i = 0; i < g_ruleCount; i++) {
         RULE *r = g_rules[i];
         WCHAR h[256];
@@ -561,6 +576,7 @@ static RULE *find_rule_for_host(const WCHAR *host)
         BOOL secure = FALSE;
         const WCHAR *path = NULL;
 
+        if (r->match[0] && host_match(r->match, host)) return r;
         if (r->kind == 1 && parse_url(r->record, h, 256, &p, &secure, &path)) {
             if (lstrcmpiW(h, host) == 0) return r;
         }
@@ -942,6 +958,29 @@ static void proxy_start(void)
     }
 }
 
+/* 域名通配匹配：pattern 支持 *（任意字符，含点），大小写不敏感 */
+static BOOL host_match(const WCHAR *pattern, const WCHAR *host)
+{
+    const WCHAR *p = pattern, *h = host;
+
+    while (*p) {
+        if (*p == L'*') {
+            p++;
+            if (!*p) return TRUE;
+            while (*h) {
+                if (host_match(p, h)) return TRUE;
+                h++;
+            }
+            return host_match(p, h);
+        }
+        if (!*h) return FALSE;
+        if (towlower(*p) != towlower(*h)) return FALSE;
+        p++;
+        h++;
+    }
+    return *h == 0;
+}
+
 /* ---------- 规则管理 ---------- */
 
 static void rule_start(RULE *r)
@@ -1009,8 +1048,12 @@ static void config_save(void)
         WCHAR key[32];
         _snwprintf(key, 32, L"rule%d", i + 1);
         if (i < g_ruleCount) {
-            _snwprintf(buf, 512, L"%s %d %d", g_rules[i]->record, g_rules[i]->port,
-                       g_rules[i]->enabled ? 1 : 0);
+            if (g_rules[i]->match[0])
+                _snwprintf(buf, 512, L"%s %d %d %s", g_rules[i]->record, g_rules[i]->port,
+                           g_rules[i]->enabled ? 1 : 0, g_rules[i]->match);
+            else
+                _snwprintf(buf, 512, L"%s %d %d", g_rules[i]->record, g_rules[i]->port,
+                           g_rules[i]->enabled ? 1 : 0);
             WritePrivateProfileStringW(L"rules", key, buf, g_iniPath);
         } else {
             WritePrivateProfileStringW(L"rules", key, NULL, g_iniPath);
@@ -1037,18 +1080,19 @@ static void config_load(void)
 
     g_ruleCount = 0;
     for (i = 0; i < count; i++) {
-        WCHAR rec[256];
+        WCHAR rec[256], m[256];
         int port = 0;
         BOOL enabled = TRUE;
 
         _snwprintf(key, 32, L"rule%d", i + 1);
         buf[0] = 0;
         GetPrivateProfileStringW(L"rules", key, L"", buf, 512, g_iniPath);
-        if (!parse_rule_line(buf, rec, 256, &port, &enabled)) continue;
+        if (!parse_rule_line(buf, rec, 256, &port, &enabled, m, 256)) continue;
         {
             RULE *r = (RULE *)calloc(1, sizeof(RULE));
             if (!r) break;
             lstrcpynW(r->record, rec, 256);
+            lstrcpynW(r->match, m, 256);
             r->kind = (!wcsncmp(rec, L"http://", 7) || !wcsncmp(rec, L"https://", 8)) ? 1 : 0;
             r->port = port;
             r->enabled = enabled;
@@ -1080,26 +1124,30 @@ static void build_ui(void)
 
     mk(L"BUTTON", L"添加", BS_PUSHBUTTON, 526, 18, 76, 26, IDC_BT_ADD, font);
 
-    g_lbRules = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 18, 54, 588, 168, IDC_LB_RULES, font);
+    mk(L"STATIC", L"匹配域名(可选，支持 *)", SS_LEFT, 18, 54, 148, 20, 0, font);
+    g_edMatch = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 172, 52, 430, 24, IDC_ED_MATCH, font);
 
-    mk(L"BUTTON", L"启用所选", BS_PUSHBUTTON, 18, 232, 78, 30, IDC_BT_ENABLE, font);
-    mk(L"BUTTON", L"停用所选", BS_PUSHBUTTON, 100, 232, 78, 30, IDC_BT_DISABLE, font);
-    mk(L"BUTTON", L"删除", BS_PUSHBUTTON, 182, 232, 64, 30, IDC_BT_DEL, font);
-    mk(L"BUTTON", L"全部启动", BS_PUSHBUTTON, 250, 232, 78, 30, IDC_BT_START, font);
-    mk(L"BUTTON", L"全部停止", BS_PUSHBUTTON, 332, 232, 78, 30, IDC_BT_STOP, font);
-    g_ckAuto = mk(L"BUTTON", L"启动时自动连接", BS_AUTOCHECKBOX, 420, 236, 120, 24, IDC_CK_AUTO, font);
-    g_lbStatus = mk(L"STATIC", L"", SS_LEFT, 548, 240, 58, 22, IDC_LB_STATUS, font);
+    g_lbRules = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 18, 86, 588, 168, IDC_LB_RULES, font);
+
+    mk(L"BUTTON", L"启用所选", BS_PUSHBUTTON, 18, 264, 78, 30, IDC_BT_ENABLE, font);
+    mk(L"BUTTON", L"停用所选", BS_PUSHBUTTON, 100, 264, 78, 30, IDC_BT_DISABLE, font);
+    mk(L"BUTTON", L"删除", BS_PUSHBUTTON, 182, 264, 64, 30, IDC_BT_DEL, font);
+    mk(L"BUTTON", L"全部启动", BS_PUSHBUTTON, 250, 264, 78, 30, IDC_BT_START, font);
+    mk(L"BUTTON", L"全部停止", BS_PUSHBUTTON, 332, 264, 78, 30, IDC_BT_STOP, font);
+    g_ckAuto = mk(L"BUTTON", L"启动时自动连接", BS_AUTOCHECKBOX, 420, 268, 120, 24, IDC_CK_AUTO, font);
+    g_lbStatus = mk(L"STATIC", L"", SS_LEFT, 548, 272, 58, 22, IDC_LB_STATUS, font);
 
     g_edLog = mk(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
-                 18, 272, 588, 150, IDC_ED_LOG, font);
+                 18, 304, 588, 150, IDC_ED_LOG, font);
 }
 
 static void on_add(void)
 {
-    WCHAR record[256], portText[32];
+    WCHAR record[256], portText[32], match[256];
     int port, i;
 
     get_text(g_edRecord, record, 256);
+    get_text(g_edMatch, match, 256);
     get_text(g_edPort, portText, 32);
     port = _wtoi(portText);
 
@@ -1116,6 +1164,7 @@ static void on_add(void)
         RULE *r = (RULE *)calloc(1, sizeof(RULE));
         if (!r) { log_line(L"内存不足"); return; }
         lstrcpynW(r->record, record, 256);
+        lstrcpynW(r->match, match, 256);
         r->kind = (!wcsncmp(record, L"http://", 7) || !wcsncmp(record, L"https://", 8)) ? 1 : 0;
         r->port = port;
         r->enabled = TRUE;
@@ -1337,7 +1386,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 
     hwnd = CreateWindowExW(0, L"TxtMuxWnd", APP_TITLE,
                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 640, 476,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 640, 508,
                            NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
 
