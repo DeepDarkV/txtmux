@@ -411,7 +411,7 @@ static DWORD WINAPI client_thread(LPVOID param)
     _snprintf(portA, sizeof(portA), "%d", port);
 
     ZeroMemory(&hints, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;   /* 按目标自身的 A/AAAA 选择，IPv6 不被降级 */
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(hostA, portA, &hints, &res) != 0) {
         log_line(L"[%s] 解析目标 %s 失败", r->record, host);
@@ -617,7 +617,7 @@ static SOCKET dial_for(const WCHAR *host, int port, BOOL *usedRule)
     _snprintf(portA, sizeof(portA), "%d", targetPort);
 
     ZeroMemory(&hints, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;   /* 按目标自身的 A/AAAA 选择，IPv6 不被降级 */
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(hostA, portA, &hints, &res) != 0) return INVALID_SOCKET;
 
