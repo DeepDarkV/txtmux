@@ -153,6 +153,10 @@ public class Engine {
             save();
             Logx.line("规则%s：%s :%d%s", index >= 0 ? "已修改" : "已新增", s, port,
                     m.isEmpty() ? "" : "（匹配 " + m + "）");
+            if (r.enabled && !r.running) {
+                if (app != null) MuxService.start(app);
+                startRule(r);
+            }
         }
         return null;
     }
@@ -175,6 +179,10 @@ public class Engine {
             if (!enabled) stopRule(r);
             save();
             Logx.line("规则 %s 已%s", r.name(), enabled ? "启用" : "停用");
+            if (enabled && !r.running) {
+                if (app != null) MuxService.start(app);
+                startRule(r);
+            }
         }
     }
 

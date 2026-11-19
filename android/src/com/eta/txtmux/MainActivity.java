@@ -236,7 +236,7 @@ public class MainActivity extends Activity {
         }), weightLp(1));
         col.addView(r3);
 
-        col.addView(title("点一条规则可编辑，长按可启用/停用；匹配域名留空的规则只做本地端口转发。", 11, 0xff888888));
+        col.addView(title("点一条规则可编辑，长按可启用/停用。\n匹配域名留空的规则 = 仅端口转发：添加或点「全部启动」后会监听 127.0.0.1:<端口>，客户端直接连这个端口即可（无需代理）。", 11, 0xff888888));
 
         /* ---- 代理设置 ---- */
         col.addView(title("本地代理（HTTP CONNECT / SOCKS5，可不开）", 14, 0xff1565c0));
