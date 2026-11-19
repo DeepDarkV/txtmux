@@ -14,6 +14,7 @@ public class Rule {
     /* ---- 运行时 ---- */
     final Object lock = new Object();
     volatile ServerSocket ss;
+    volatile java.net.DatagramSocket udp;
     volatile Thread thread;
     volatile boolean running;
     volatile boolean stopFlag;

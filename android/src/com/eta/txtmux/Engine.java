@@ -220,6 +220,128 @@ public class Engine {
         stopProxy();
     }
 
+    /* ---------------- UDP 中继（OpenVPN 之类走 UDP 的服务） ---------------- */
+
+    private void startUdp(final Rule r) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                udpLoop(r);
+            }
+        }, "txtmux-udp-" + r.port);
+        t.start();
+    }
+
+    private void udpLoop(Rule r) {
+        java.net.DatagramSocket local = null;
+        try {
+            local = new java.net.DatagramSocket(null);
+            local.setReuseAddress(true);
+            local.bind(new java.net.InetSocketAddress(bindAddress(cfg.bind), r.port));
+        } catch (Throwable e) {
+            Logx.line("[%s] UDP 监听 %s:%d 失败（%s）", r.name(), cfg.bind, r.port, e.getMessage());
+            return;
+        }
+        r.udp = local;
+        Logx.line("[%s] UDP 已监听 %s:%d", r.name(), cfg.bind, r.port);
+        final java.util.concurrent.ConcurrentHashMap<String, UdpSess> sess =
+                new java.util.concurrent.ConcurrentHashMap<String, UdpSess>();
+        byte[] buf = new byte[65535];
+        while (!r.stopFlag) {
+            java.net.DatagramPacket p = new java.net.DatagramPacket(buf, buf.length);
+            try {
+                local.receive(p);
+            } catch (Throwable e) {
+                break;
+            }
+            String key = p.getAddress().getHostAddress() + ":" + p.getPort();
+            UdpSess s = sess.get(key);
+            if (s == null) {
+                Target t = targetFor(r);
+                if (t == null) continue;
+                s = new UdpSess(local, p.getAddress(), p.getPort());
+                if (!s.open(t.host, t.port)) continue;
+                sess.put(key, s);
+                Logx.line("[%s] UDP 会话 %s -> %s:%d", r.name(), key, t.host, t.port);
+            }
+            s.send(p.getData(), p.getLength());
+        }
+        for (UdpSess s : sess.values()) s.close();
+        try {
+            local.close();
+        } catch (Exception ignored) {
+        }
+        r.udp = null;
+        Logx.line("[%s] UDP 已停止监听 %d", r.name(), r.port);
+    }
+
+    private final class UdpSess {
+        final java.net.DatagramSocket back;
+        final java.net.InetAddress clientAddr;
+        final int clientPort;
+        java.net.DatagramSocket up;
+        volatile long last = System.currentTimeMillis();
+
+        UdpSess(java.net.DatagramSocket back, java.net.InetAddress addr, int port) {
+            this.back = back;
+            this.clientAddr = addr;
+            this.clientPort = port;
+        }
+
+        boolean open(final String host, final int port) {
+            try {
+                java.net.InetAddress t = java.net.InetAddress.getByName(host);
+                up = new java.net.DatagramSocket();
+                up.connect(t, port);
+                up.setSoTimeout(60000);
+            } catch (Throwable e) {
+                Logx.line("WARN UDP 建立会话失败（%s）", e.getMessage());
+                return false;
+            }
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    byte[] b = new byte[65535];
+                    while (!closed) {
+                        java.net.DatagramPacket p = new java.net.DatagramPacket(b, b.length);
+                        try {
+                            up.receive(p);
+                        } catch (Throwable e) {
+                            break;
+                        }
+                        last = System.currentTimeMillis();
+                        try {
+                            back.send(new java.net.DatagramPacket(p.getData(), p.getLength(),
+                                    clientAddr, clientPort));
+                        } catch (Throwable e) {
+                            break;
+                        }
+                    }
+                    close();
+                }
+            }, "txtmux-udp-up").start();
+            return true;
+        }
+
+        void send(byte[] data, int len) {
+            last = System.currentTimeMillis();
+            try {
+                up.send(new java.net.DatagramPacket(data, len));
+            } catch (Throwable ignored) {
+            }
+        }
+
+        void close() {
+            closed = true;
+            try {
+                up.close();
+            } catch (Exception ignored) {
+            }
+        }
+
+        volatile boolean closed;
+    }
+
     /** 把 running 与实际套接字/线程对齐，避免界面显示"运行中"实际已断 */
     public void healthCheck() {
         for (Rule r : rules()) {
@@ -271,6 +393,7 @@ public class Engine {
         }, "txtmux-rule-" + r.port);
         r.thread = t;
         t.start();
+        startUdp(r);
         /* 启动就解析一次：列表上直接显示真实目标或失败原因，不用等第一个连接 */
         new Thread(new Runnable() {
             @Override
@@ -292,6 +415,13 @@ public class Engine {
         if (ss != null) {
             try {
                 ss.close();
+            } catch (Exception ignored) {
+            }
+        }
+        java.net.DatagramSocket du = r.udp;
+        if (du != null) {
+            try {
+                du.close();
             } catch (Exception ignored) {
             }
         }
@@ -365,6 +495,7 @@ public class Engine {
                 Logx.line("[%s] 没有可用目标，丢弃连接", r.name());
                 return;
             }
+            Logx.line("[%s] 收到连接 -> %s:%d", r.name(), t.host, t.port);
             try {
                 up = dial(t.host, t.port);
             } catch (IOException e) {
