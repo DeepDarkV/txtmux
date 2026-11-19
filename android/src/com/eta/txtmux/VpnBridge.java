@@ -63,6 +63,8 @@ public class VpnBridge extends VpnService {
     private Thread loop;
     private Thread retx;
     private volatile boolean stop;
+    private volatile String ourIface = "";
+    private android.net.ConnectivityManager.NetworkCallback netCb;
 
     private final Map<Integer, String> fakeToDomain = new HashMap<Integer, String>();
     private final Map<String, Integer> domainToFake = new HashMap<String, Integer>();
@@ -128,6 +130,45 @@ public class VpnBridge extends VpnService {
         super.onDestroy();
     }
 
+    /** 别的 VPN 一接管默认网络，就只关掉无感分流，端口转发保留 */
+    private void watchDefaultNetwork() {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+            android.net.LinkProperties lp = cm.getLinkProperties(cm.getActiveNetwork());
+            if (lp != null && lp.getInterfaceName() != null) ourIface = lp.getInterfaceName();
+            if (netCb != null) return;
+            netCb = new android.net.ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onCapabilitiesChanged(android.net.Network network,
+                                                  android.net.NetworkCapabilities caps) {
+                    if (!running) return;
+                    if (!caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) return;
+                    String ifn = "";
+                    try {
+                        android.net.ConnectivityManager cm2 =
+                                (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                        android.net.LinkProperties p = cm2.getLinkProperties(network);
+                        if (p != null) ifn = p.getInterfaceName() == null ? "" : p.getInterfaceName();
+                    } catch (Throwable ignored) {
+                    }
+                    if (!ourIface.isEmpty() && ifn.equals(ourIface)) return;   /* 还是我们自己 */
+                    Logx.line("检测到其它 VPN 建立连接（%s），自动关闭无感分流，端口转发保持不变", ifn);
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            stopVpn();
+                        }
+                    });
+                }
+            };
+            cm.registerDefaultNetworkCallback(netCb);
+        } catch (Throwable t) {
+            Logx.line("WARN 监听默认网络失败: %s", t.getMessage());
+        }
+    }
+
     private void stopVpn() {
         stop = true;
         running = false;
@@ -151,6 +192,20 @@ public class VpnBridge extends VpnService {
         pfd = null;
         tin = null;
         tout = null;
+        try {
+            if (netCb != null) {
+                android.net.ConnectivityManager cm =
+                        (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                if (cm != null) cm.unregisterNetworkCallback(netCb);
+            }
+        } catch (Throwable ignored) {
+        }
+        netCb = null;
+        ourIface = "";
+        try {
+            if (Engine.get().isAnythingRunning()) MuxService.start(this);
+        } catch (Throwable ignored) {
+        }
         if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
         Logx.line("无感分流已停止");
@@ -190,6 +245,9 @@ public class VpnBridge extends VpnService {
             }, "txtmux-retx");
             retx.start();
             Logx.line("无感分流已开启：命中「匹配域名」的访问会被自动改写到真实端点");
+            /* 保证端口转发进程不因为 VPN 结束而被回收 */
+            MuxService.start(this);
+            watchDefaultNetwork();
         } catch (Throwable t) {
             Logx.line("WARN VPN 启动异常: %s", t.getMessage());
             stopSelf();
