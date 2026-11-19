@@ -490,6 +490,8 @@ public class Engine {
         Socket up = null;
         try {
             client.setTcpNoDelay(true);
+            client.setReceiveBufferSize(256 * 1024);
+            client.setSendBufferSize(256 * 1024);
             Target t = targetFor(r);
             if (t == null) {
                 Logx.line("[%s] 没有可用目标，丢弃连接", r.name());
@@ -1098,7 +1100,7 @@ public class Engine {
     }
 
     private static void copyStream(Socket from, Socket to) {
-        byte[] buf = new byte[8192];
+        byte[] buf = new byte[65536];
         try {
             InputStream in = from.getInputStream();
             OutputStream out = to.getOutputStream();

@@ -56,6 +56,24 @@ public class VpnBridge extends VpnService {
     private static final int MSS_DATA = 1400;
 
     static volatile boolean running = false;
+    /** 是否是「被别的 VPN 顶掉」而停的（只有这种情况才自动恢复） */
+    static volatile boolean suspendedByOther = false;
+    static final String PREFS = "txtmux_vpn";
+
+    public static void setWanted(android.content.Context c, boolean v) {
+        try {
+            c.getSharedPreferences(PREFS, 0).edit().putBoolean("want", v).apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static boolean wanted(android.content.Context c) {
+        try {
+            return c.getSharedPreferences(PREFS, 0).getBoolean("want", false);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
 
     private ParcelFileDescriptor pfd;
     private FileInputStream tin;
@@ -64,6 +82,8 @@ public class VpnBridge extends VpnService {
     private Thread retx;
     private volatile boolean stop;
     private volatile String ourIface = "";
+    private volatile long vpnUpAt = 0;
+    private volatile boolean stopping = false;
     private android.net.ConnectivityManager.NetworkCallback netCb;
 
     private final Map<Integer, String> fakeToDomain = new HashMap<Integer, String>();
@@ -119,7 +139,8 @@ public class VpnBridge extends VpnService {
 
     @Override
     public void onRevoke() {
-        Logx.line("VPN 授权被系统收回");
+        Logx.line("VPN 授权被系统收回（通常是有别的 VPN 接管）");
+        suspendedByOther = true;      /* 记下来：这是被顶掉，不是用户手动关的 */
         stopVpn();
         super.onRevoke();
     }
@@ -138,6 +159,7 @@ public class VpnBridge extends VpnService {
             if (cm == null) return;
             android.net.LinkProperties lp = cm.getLinkProperties(cm.getActiveNetwork());
             if (lp != null && lp.getInterfaceName() != null) ourIface = lp.getInterfaceName();
+            vpnUpAt = System.currentTimeMillis();
             if (netCb != null) return;
             netCb = new android.net.ConnectivityManager.NetworkCallback() {
                 @Override
@@ -153,7 +175,12 @@ public class VpnBridge extends VpnService {
                         if (p != null) ifn = p.getInterfaceName() == null ? "" : p.getInterfaceName();
                     } catch (Throwable ignored) {
                     }
-                    if (!ourIface.isEmpty() && ifn.equals(ourIface)) return;   /* 还是我们自己 */
+                    if (ifn.equals(ourIface)) return;                          /* 接口名对得上，是我们自己 */
+                    if (System.currentTimeMillis() - vpnUpAt < 8000) {          /* 刚建立：认领为自己的 tun */
+                        ourIface = ifn;
+                        return;
+                    }
+                    suspendedByOther = true;
                     Logx.line("检测到其它 VPN 建立连接（%s），自动关闭无感分流，端口转发保持不变", ifn);
                     new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
                         @Override
@@ -170,6 +197,8 @@ public class VpnBridge extends VpnService {
     }
 
     private void stopVpn() {
+        if (stopping) return;
+        stopping = true;
         stop = true;
         running = false;
         closeAllConns();
@@ -229,6 +258,7 @@ public class VpnBridge extends VpnService {
             tin = new FileInputStream(pfd.getFileDescriptor());
             tout = new FileOutputStream(pfd.getFileDescriptor());
             stop = false;
+            stopping = false;
             running = true;
             loop = new Thread(new Runnable() {
                 @Override
@@ -244,6 +274,8 @@ public class VpnBridge extends VpnService {
                 }
             }, "txtmux-retx");
             retx.start();
+            setWanted(this, true);
+            suspendedByOther = false;
             Logx.line("无感分流已开启：命中「匹配域名」的访问会被自动改写到真实端点");
             /* 保证端口转发进程不因为 VPN 结束而被回收 */
             MuxService.start(this);

@@ -19,6 +19,88 @@ public class MuxService extends Service {
     public static final String ACTION_STOP = "com.eta.txtmux.action.STOP";
 
     static volatile boolean running = false;
+    private android.os.Handler ui;
+    private android.net.ConnectivityManager.NetworkCallback netCb;
+    private final Runnable restore = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                if (!VpnBridge.wanted(MuxService.this) || VpnBridge.running) return;
+                if (!VpnBridge.suspendedByOther) return;
+                if (anyVpn()) return;              /* 还有 VPN 在（别的或我们自己）就别抢 */
+                android.content.Intent prep = android.net.VpnService.prepare(MuxService.this);
+                if (prep == null) {
+                    Logx.line("其它 VPN 已断开，自动恢复无感分流");
+                    VpnBridge.suspendedByOther = false;
+                    startForegroundService(new android.content.Intent(MuxService.this, VpnBridge.class));
+                } else {
+                    Logx.line("其它 VPN 已断开，但恢复无感分流需要重新授权，请打开应用点一下「开启无感分流」");
+                }
+            } catch (Throwable t) {
+                Logx.line("WARN 恢复无感分流失败: %s", t.getMessage());
+            }
+        }
+    };
+
+    private boolean anyVpn() {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            for (android.net.Network n : cm.getAllNetworks()) {
+                android.net.NetworkCapabilities c = cm.getNetworkCapabilities(n);
+                if (c != null && c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private final Runnable tick = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                if (VpnBridge.wanted(MuxService.this) && !VpnBridge.running
+                        && VpnBridge.suspendedByOther && !anyVpn()) {
+                    Logx.line("检测到没有 VPN 在运行，自动恢复无感分流");
+                    android.content.Intent prep = android.net.VpnService.prepare(MuxService.this);
+                    if (prep == null) {
+                        VpnBridge.suspendedByOther = false;
+                        startForegroundService(new android.content.Intent(MuxService.this, VpnBridge.class));
+                    } else {
+                        Logx.line("恢复无感分流需要重新授权，请打开应用点一下「开启无感分流」");
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            if (ui != null) ui.postDelayed(this, 10000);
+        }
+    };
+
+    private void watchDefaultNetwork() {
+        try {
+            ui = new android.os.Handler(getMainLooper());
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+            netCb = new android.net.ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onCapabilitiesChanged(android.net.Network n,
+                                                  android.net.NetworkCapabilities caps) {
+                    if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) return;
+                    if (!VpnBridge.wanted(MuxService.this) || VpnBridge.running) return;
+                    if (!VpnBridge.suspendedByOther) return;   /* 没被顶掉过，不主动抢 VPN 槽 */
+                    if (anyVpn()) return;                     /* 还有别的 VPN 在 */
+                    ui.removeCallbacks(restore);
+                    ui.postDelayed(restore, 8000);
+                }
+            };
+            cm.registerDefaultNetworkCallback(netCb);
+            ui.postDelayed(tick, 10000);
+        } catch (Throwable t) {
+            Logx.line("WARN 监听默认网络失败: %s", t.getMessage());
+        }
+    }
     private android.os.PowerManager.WakeLock wakeLock;
 
     public static void start(Context c) {
@@ -78,6 +160,7 @@ public class MuxService extends Service {
     public void onCreate() {
         super.onCreate();
         Engine.get().attach(this);
+        watchDefaultNetwork();
         try {
             android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
             if (pm != null) {
@@ -134,6 +217,14 @@ public class MuxService extends Service {
     public void onDestroy() {
         super.onDestroy();
         running = false;
+        try {
+            if (netCb != null) {
+                android.net.ConnectivityManager cm =
+                        (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                if (cm != null) cm.unregisterNetworkCallback(netCb);
+            }
+        } catch (Throwable ignored) {
+        }
         if (wakeLock != null && wakeLock.isHeld()) {
             try {
                 wakeLock.release();

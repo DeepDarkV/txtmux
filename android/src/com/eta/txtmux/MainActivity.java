@@ -86,6 +86,12 @@ public class MainActivity extends Activity {
         Logx.addSink(sink);
         String hist = Logx.tail(200);
         logView.setText(hist.isEmpty() ? Logx.text() : hist);
+        logView.post(new Runnable() {
+            @Override
+            public void run() {
+                logScroll.scrollTo(0, logView.getMeasuredHeight());
+            }
+        });
         loadEditors();
         askNotifyPermission();
         Cfg c0 = eng.cfg();
@@ -94,6 +100,7 @@ public class MainActivity extends Activity {
                 c0.proxyPort > 0 ? String.valueOf(c0.proxyPort) : "未启用",
                 c0.bind);
         ui.post(refresh);
+        applyStartupState();
     }
 
     @Override
@@ -335,6 +342,25 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(220));
         logScroll.setLayoutParams(lp);
         logScroll.setBackgroundColor(0xff111418);
+        logScroll.setSmoothScrollingEnabled(false);
+        logScroll.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, android.view.MotionEvent e) {
+                if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+                    v.getParent().requestDisallowInterceptTouchEvent(true);
+                } else if (e.getActionMasked() == android.view.MotionEvent.ACTION_UP
+                        || e.getActionMasked() == android.view.MotionEvent.ACTION_CANCEL) {
+                    v.getParent().requestDisallowInterceptTouchEvent(false);
+                }
+                return false;
+            }
+        });
+        logScroll.setOnScrollChangeListener(new View.OnScrollChangeListener() {
+            @Override
+            public void onScrollChange(View v, int x, int y, int ox, int oy) {
+                followLog = isLogAtBottom();
+            }
+        });
         logView = new TextView(this);
         logView.setTextSize(10);
         logView.setTextColor(0xffd0d6dc);
@@ -490,8 +516,30 @@ public class MainActivity extends Activity {
         statusView.setText(eng.statusText());
     }
 
+    /** 打开软件时按每条规则的启用状态自动应用；有匹配域名规则则自动开无感分流 */
+    private void applyStartupState() {
+        boolean anyEnabled = false;
+        boolean anyMatch = false;
+        for (Rule r : eng.rules()) {
+            if (!r.enabled) continue;
+            anyEnabled = true;
+            if (r.match != null && !r.match.isEmpty()) anyMatch = true;
+        }
+        if (!anyEnabled) return;
+        MuxService.start(this);
+        eng.startAll();
+        Logx.line("按规则启用状态自动启动：%d 条规则", eng.rules().size());
+        if (anyMatch && !VpnBridge.running) {
+            VpnBridge.setWanted(this, true);
+            Intent prep = VpnService.prepare(this);
+            if (prep == null) startVpnNow();
+            else startActivityForResult(prep, REQ_VPN);
+        }
+    }
+
     private void onVpnClick() {
         if (VpnBridge.running) {
+            VpnBridge.setWanted(this, false);
             try {
                 startService(new Intent(this, VpnBridge.class).setAction(VpnBridge.ACTION_STOP));
             } catch (Throwable ignored) {
@@ -697,17 +745,32 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean isLogAtBottom() {
+        if (logScroll.getChildCount() == 0) return true;
+        View child = logScroll.getChildAt(0);
+        int diff = child.getBottom() - (logScroll.getHeight() + logScroll.getScrollY());
+        return diff <= dp(8);
+    }
+
+    private static String tailLines(String text, int keep) {
+        String[] ls = text.split("\n");
+        int from = Math.max(0, ls.length - keep);
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < ls.length; i++) sb.append(ls[i]).append('\n');
+        return sb.toString();
+    }
+
     private void appendLogLine(String line) {
-        if (logView.length() > 40000) {
-            logView.setText(Logx.text());
+        if (logView.length() > 30000) {
+            logView.setText(tailLines(Logx.text(), 300));
         } else {
             logView.append(line + "\n");
         }
         if (followLog) {
-            logScroll.post(new Runnable() {
+            logView.post(new Runnable() {
                 @Override
                 public void run() {
-                    logScroll.fullScroll(View.FOCUS_DOWN);
+                    logScroll.scrollTo(0, logView.getMeasuredHeight());
                 }
             });
         }
