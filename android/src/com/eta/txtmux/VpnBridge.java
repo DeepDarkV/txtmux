@@ -249,6 +249,11 @@ public class VpnBridge extends VpnService {
             b.addRoute(FAKE_NET, FAKE_PREFIX);
             b.addDnsServer(DNS_IP);
             if (Build.VERSION.SDK_INT >= 29) b.setMetered(false);
+            /* 只接管 IPv4；显式声明支持 IPv6，避免整族被当成"VPN 不支持"而黑洞 */
+            try {
+                b.allowFamily(android.system.OsConstants.AF_INET6);
+            } catch (Throwable ignored) {
+            }
             pfd = b.establish();
             if (pfd == null) {
                 Logx.line("WARN VPN 建立失败（没有授权？）");
