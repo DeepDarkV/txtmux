@@ -392,11 +392,13 @@ public class MainActivity extends Activity {
                 }
             }
             if (hasMatch) {
-                color = 0xffb05000;
-                text = "注意：有规则填了「匹配域名」，但代理端口为 0，"
-                        + "代理分流不会生效（这些规则现在只做本地端口转发）。要用通配域名分流，先填代理端口并保存。";
+                color = 0xff666666;
+                text = "「匹配域名」有两种生效方式，按需选一种：\n"
+                        + "① 无感分流（推荐）：开着它就走 VPN 按域名改写，不需要代理端口；\n"
+                        + "② 本地代理：填代理端口并保存，再把系统/应用的代理指到 127.0.0.1:<端口>。\n"
+                        + "两者都没开时，这些规则只做 127.0.0.1:<本地端口> 的端口转发。";
             } else {
-                text = "代理端口为 0 时只做本地端口转发。";
+                text = "代理端口为 0：规则只监听 127.0.0.1:<本地端口> 做端口转发；需要按域名自动改写时开「无感分流」即可。";
             }
         }
         if (lastHint.equals(text)) return;
@@ -488,10 +490,27 @@ public class MainActivity extends Activity {
     }
 
     private void stopAll() {
-        eng.stopAll();
-        MuxService.stop(this);
-        statusView.setText(eng.statusText());
-        Toast.makeText(this, "已全部停止", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "正在停止…", Toast.LENGTH_SHORT).show();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    eng.stopAll();
+                } catch (Throwable t) {
+                    Logx.line("WARN 停止规则出错: %s", t.getMessage());
+                }
+                MuxService.stop(MainActivity.this);
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        listSig = "";
+                        statusView.setText(eng.statusText());
+                        rebuildList();
+                        Toast.makeText(MainActivity.this, "已全部停止", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        }, "txtmux-stop").start();
     }
 
     private void onSaveProxy() {
@@ -521,14 +540,14 @@ public class MainActivity extends Activity {
         boolean anyEnabled = false;
         boolean anyMatch = false;
         for (Rule r : eng.rules()) {
-            if (!r.enabled) continue;
+            if (!r.enabled || !r.active) continue;
             anyEnabled = true;
             if (r.match != null && !r.match.isEmpty()) anyMatch = true;
         }
         if (!anyEnabled) return;
         MuxService.start(this);
-        eng.startAll();
-        Logx.line("按规则启用状态自动启动：%d 条规则", eng.rules().size());
+        eng.resumeActive();
+        Logx.line("按上次运行状态恢复规则：%d 条", eng.rules().size());
         if (anyMatch && !VpnBridge.running) {
             VpnBridge.setWanted(this, true);
             Intent prep = VpnService.prepare(this);
@@ -540,6 +559,14 @@ public class MainActivity extends Activity {
     private void onVpnClick() {
         if (VpnBridge.running) {
             VpnBridge.setWanted(this, false);
+            java.util.List<Rule> rs = eng.rules();
+            for (int i = 0; i < rs.size(); i++) {
+                Rule r = rs.get(i);
+                if (r.enabled && r.match != null && !r.match.isEmpty()) {
+                    eng.setEnabled(i, false);
+                    Logx.line("关闭无感分流：同时停用规则 %s", r.src);
+                }
+            }
             try {
                 startService(new Intent(this, VpnBridge.class).setAction(VpnBridge.ACTION_STOP));
             } catch (Throwable ignored) {
@@ -568,6 +595,14 @@ public class MainActivity extends Activity {
     }
 
     private void startVpnNow() {
+        java.util.List<Rule> rs = eng.rules();
+        for (int i = 0; i < rs.size(); i++) {
+            Rule r = rs.get(i);
+            if (r.match != null && !r.match.isEmpty() && !r.enabled) {
+                eng.setEnabled(i, true);
+                Logx.line("开启无感分流：同时启用规则 %s", r.src);
+            }
+        }
         try {
             Intent i = new Intent(this, VpnBridge.class);
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);

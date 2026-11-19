@@ -157,6 +157,7 @@ public class Engine {
                 if (app != null) MuxService.start(app);
                 startRule(r);
             }
+            syncVpnWithRules();
         }
         return null;
     }
@@ -183,6 +184,7 @@ public class Engine {
                 if (app != null) MuxService.start(app);
                 startRule(r);
             }
+            syncVpnWithRules();
         }
     }
 
@@ -206,6 +208,41 @@ public class Engine {
 
     /* ---------------- 启动 / 停止 ---------------- */
 
+    /** 让无感分流跟着规则走：有启用中的匹配域名规则就开，否则关 */
+    public void syncVpnWithRules() {
+        if (app == null) return;
+        boolean anyMatch = false;
+        for (Rule r : rules()) {
+            if (r.enabled && r.active && r.match != null && !r.match.isEmpty()) {
+                anyMatch = true;
+                break;
+            }
+        }
+        if (anyMatch) {
+            if (VpnBridge.running) return;
+            try {
+                if (android.net.VpnService.prepare(app) == null) {
+                    VpnBridge.setWanted(app, true);
+                    app.startForegroundService(new android.content.Intent(app, VpnBridge.class));
+                    Logx.line("有启用中的匹配域名规则，自动开启无感分流");
+                } else {
+                    Logx.line("有启用中的匹配域名规则，但无感分流需要你在界面点一次授权");
+                }
+            } catch (Throwable t) {
+                Logx.line("WARN 开启无感分流失败: %s", t.getMessage());
+            }
+        } else if (VpnBridge.running) {
+            VpnBridge.setWanted(app, false);
+            VpnBridge.suspendedByOther = false;
+            try {
+                app.startService(new android.content.Intent(app, VpnBridge.class)
+                        .setAction(VpnBridge.ACTION_STOP));
+                Logx.line("没有启用中的匹配域名规则，关闭无感分流");
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     public void startAll() {
         Cfg c = cfg;
         if (c == null) return;
@@ -213,11 +250,31 @@ public class Engine {
             if (r.enabled) startRule(r);
         }
         startProxy();
+        syncVpnWithRules();
+    }
+
+    /** 启动时恢复"上次在跑"的规则，不改变其它规则的状态 */
+    public void resumeActive() {
+        for (Rule r : rules()) {
+            if (r.enabled && r.active) startRule(r);
+        }
+        startProxy();
+        syncVpnWithRules();
     }
 
     public void stopAll() {
         for (Rule r : rules()) stopRule(r);
         stopProxy();
+        if (VpnBridge.running) {
+            VpnBridge.setWanted(app, false);
+            VpnBridge.suspendedByOther = false;
+            try {
+                app.startService(new android.content.Intent(app, VpnBridge.class)
+                        .setAction(VpnBridge.ACTION_STOP));
+                Logx.line("规则已全部停止，同步关闭无感分流");
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     /* ---------------- UDP 中继（OpenVPN 之类走 UDP 的服务） ---------------- */
@@ -382,6 +439,10 @@ public class Engine {
     }
 
     public void startRule(final Rule r) {
+        if (!r.active) {
+            r.active = true;
+            save();
+        }
         if (r.thread != null) return;
         r.stopFlag = false;
         r.lastError = "";
@@ -425,14 +486,13 @@ public class Engine {
             } catch (Exception ignored) {
             }
         }
-        Thread t = r.thread;
-        try {
-            t.join(2000);
-        } catch (InterruptedException ignored) {
-        }
         r.thread = null;
         r.ss = null;
         r.running = false;
+        if (r.active) {
+            r.active = false;
+            save();
+        }
     }
 
     private void acceptLoop(Rule r) {
@@ -741,10 +801,6 @@ public class Engine {
                 ss.close();
             } catch (Exception ignored) {
             }
-        }
-        try {
-            proxyThread.join(2000);
-        } catch (InterruptedException ignored) {
         }
         proxyThread = null;
         proxyRunning = false;

@@ -207,7 +207,7 @@ public class MuxService extends Service {
             Cfg c = Engine.get().cfg();
             if (c != null && c.autostart) {
                 Logx.line("开机自动运行");
-                Engine.get().startAll();
+                Engine.get().resumeActive();
             }
         }
         return START_STICKY;

@@ -52,6 +52,7 @@ public class Cfg {
                     ru.match = r.optString("match", "").trim();
                     ru.port = r.optInt("port", 0);
                     ru.enabled = r.optBoolean("enabled", true);
+                    ru.active = r.optBoolean("active", true);
                     if (ru.src.isEmpty() || ru.port <= 0 || ru.port > 65535) continue;
                     cfg.rules.add(ru);
                 }
@@ -80,6 +81,7 @@ public class Cfg {
                 x.put("match", r.match);
                 x.put("port", r.port);
                 x.put("enabled", r.enabled);
+                x.put("active", r.active);
                 arr.put(x);
             }
             o.put("rules", arr);

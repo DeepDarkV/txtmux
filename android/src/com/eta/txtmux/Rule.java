@@ -10,6 +10,8 @@ public class Rule {
     public String match = "";
     public int port;
     public boolean enabled = true;
+    /** 上一次是否处于运行状态（点过全部启动/单独启动为 true，全部停止为 false） */
+    public boolean active = true;
 
     /* ---- 运行时 ---- */
     final Object lock = new Object();
