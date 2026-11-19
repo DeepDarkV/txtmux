@@ -2,6 +2,7 @@ package com.eta.txtmux;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -29,7 +30,9 @@ public class MainActivity extends Activity {
     private EditText edProxy, edBind, edUpstream;
     private CheckBox ckBlock, ckAuto;
     private LinearLayout listBox;
-    private TextView statusView, logView, proxyHint, backHint;
+    private TextView statusView, logView, proxyHint, backHint, vpnHint;
+    private Button btVpn;
+    private static final int REQ_VPN = 21;
     private ScrollView logScroll;
     private Button btAdd;
 
@@ -65,6 +68,7 @@ public class MainActivity extends Activity {
                 }
                 rebuildList();
                 updateProxyHint();
+                updateVpnHint();
             } catch (Throwable ignored) {
             }
             ui.postDelayed(this, 1000);
@@ -271,6 +275,20 @@ public class MainActivity extends Activity {
         }), weightLp(1));
         col.addView(r5);
 
+        LinearLayout r5a = row();
+        btVpn = button("开启无感分流（VPN）", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onVpnClick();
+            }
+        });
+        r5a.addView(btVpn, weightLp(1));
+        col.addView(r5a);
+
+        vpnHint = title("", 11, 0xff888888);
+        vpnHint.setPadding(0, 0, 0, dp(6));
+        col.addView(vpnHint);
+
         LinearLayout r5b = row();
         r5b.addView(button("允许后台运行（关闭电池优化）", new View.OnClickListener() {
             @Override
@@ -471,6 +489,77 @@ public class MainActivity extends Activity {
         loadEditors();
         statusView.setText(eng.statusText());
     }
+
+    private void onVpnClick() {
+        if (VpnBridge.running) {
+            try {
+                startService(new Intent(this, VpnBridge.class).setAction(VpnBridge.ACTION_STOP));
+            } catch (Throwable ignored) {
+            }
+            Toast.makeText(this, "正在关闭无感分流", Toast.LENGTH_SHORT).show();
+            ui.postDelayed(refresh, 600);
+            return;
+        }
+        boolean hasMatch = false;
+        for (Rule r : eng.rules()) {
+            if (r.match != null && !r.match.isEmpty()) {
+                hasMatch = true;
+                break;
+            }
+        }
+        if (!hasMatch) {
+            Toast.makeText(this, "先给规则填「匹配域名」，否则没有东西可分流", Toast.LENGTH_LONG).show();
+            return;
+        }
+        Intent prep = VpnService.prepare(this);
+        if (prep != null) {
+            startActivityForResult(prep, REQ_VPN);
+        } else {
+            startVpnNow();
+        }
+    }
+
+    private void startVpnNow() {
+        try {
+            Intent i = new Intent(this, VpnBridge.class);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+            else startService(i);
+            Toast.makeText(this, "无感分流已请求开启", Toast.LENGTH_SHORT).show();
+        } catch (Throwable t) {
+            Toast.makeText(this, "开启失败：" + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+        ui.postDelayed(refresh, 800);
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req == REQ_VPN) {
+            if (res == RESULT_OK) startVpnNow();
+            else Toast.makeText(this, "没有授权 VPN，无感分流不可用", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void updateVpnHint() {
+        if (btVpn == null) return;
+        boolean on = VpnBridge.running;
+        btVpn.setText(on ? "关闭无感分流（VPN）" : "开启无感分流（VPN）");
+        StringBuilder sb = new StringBuilder();
+        sb.append(on ? "无感分流：已开启（VPN 只接管 198.18.0.0/15，其余流量不走它）"
+                    : "无感分流：未开启。开启后不用设系统代理，命中「匹配域名」的访问会自动改写端口。");
+        for (Rule r : eng.rules()) {
+            if (r.match != null && !r.match.isEmpty()) {
+                sb.append("\n分流域名：").append(r.match);
+            }
+        }
+        String text = sb.toString();
+        if (text.equals(lastVpnHint)) return;
+        lastVpnHint = text;
+        vpnHint.setTextColor(on ? 0xff2e7d32 : 0xff888888);
+        vpnHint.setText(text);
+    }
+
+    private String lastVpnHint = "";
 
     private boolean ignoringBattery() {
         try {

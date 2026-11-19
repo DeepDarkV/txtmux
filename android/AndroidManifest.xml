@@ -44,6 +44,19 @@
                 android:value="TCP 端口转发与本地代理需要常驻连接" />
         </service>
 
+        <service
+            android:name=".VpnBridge"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="按域名改写端口的本机 VPN 分流" />
+        </service>
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

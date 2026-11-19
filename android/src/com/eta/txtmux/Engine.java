@@ -462,6 +462,30 @@ public class Engine {
         return Net.connectAny(host, port, CONNECT_TIMEOUT);
     }
 
+    /** 供 VPN 分流使用：按客户端访问的域名找规则（只认「匹配域名」） */
+    public Rule ruleForHost(String host) {
+        return findRuleForHost(host);
+    }
+
+    /** 供 VPN 分流使用：返回规则当前目标（含 30 秒缓存与失败回退） */
+    public Target targetForRule(Rule r) {
+        return targetFor(r);
+    }
+
+    /** 供 VPN 分流使用：直接连 host:port，多地址并发，可选 protect（避免回环进 VPN） */
+    public Socket dialRaw(String host, int port, java.util.function.BooleanSupplier protect) {
+        try {
+            Socket s = Net.connectAny(host, port, CONNECT_TIMEOUT);
+            if (protect != null && protect.getAsBoolean()) {
+                /* 调用方负责 protect（VpnService 实例） */
+            }
+            return s;
+        } catch (IOException e) {
+            Logx.line("[VPN] 连接 %s:%d 失败（%s）", host, port, e.getMessage());
+            return null;
+        }
+    }
+
     private Rule findRuleForHost(String host) {
         for (Rule r : rules()) {
             if (r.match != null && !r.match.isEmpty() && Net.hostMatch(r.match, host)) return r;
